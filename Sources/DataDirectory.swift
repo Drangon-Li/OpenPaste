@@ -1,4 +1,5 @@
 import AppKit
+import FileProvider
 
 struct SyncRevision: Codable, Equatable {
     var time: Double
@@ -13,7 +14,27 @@ struct SyncSnapshot {
     var archive: Archive
     var index: SyncIndex
 }
+struct ICloudDownloadPending: LocalizedError {
+    var errorDescription: String? { "iCloud 内容正在下载" }
+}
+private struct DirectoryTargetChanged: LocalizedError {
+    var errorDescription: String? { "目标目录在迁移前发生变化，请重新选择" }
+}
+private struct DirectoryTarget {
+    let snapshot: SyncSnapshot
+    let hasDeviceManifests: Bool
+    let exists: Bool
+    let stamp: String?
+    let watchesLegacy: Bool
+}
+private final class DirectoryTargetHistory {
+    // Probe and migration reads are serialized by the main-queue handoff.
+    var existed = false
+    var indexes = Set<URL>()
+}
 enum DataDirectory {
+    typealias ReadinessCheck = (URL) throws -> Void
+    typealias DownloadState = (pending: Bool, downloading: Bool)
     static var defaultRoot: URL { AppEnvironment.current.defaultDataRoot }
     private static var mobileDocuments: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Mobile Documents", isDirectory: true)
@@ -40,14 +61,83 @@ enum DataDirectory {
         try HistoryStorage.write(snapshot.archive, to: cacheURL(root), sync: snapshot.index)
     }
     static func ready(_ url: URL) throws {
-        let placeholder = url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
-        if FileManager.default.fileExists(atPath: placeholder.path) {
-            try FileManager.default.startDownloadingUbiquitousItem(at: url)
-            throw PasteImport.failure("iCloud 内容正在下载，请稍后重试")
+        try ready(url, requestDownload: FileManager.default.startDownloadingUbiquitousItem(at:))
+    }
+    static func ready(_ url: URL, downloadStatus: (URL) throws -> DownloadState = DataDirectory.downloadState,
+                      requestDownload: (URL) throws -> Void) throws {
+        let placeholder = downloadPlaceholder(for: url)
+        let hasPlaceholder = try fileInfo(placeholder) != nil
+        let state = try downloadStatus(url)
+        guard hasPlaceholder || state.pending else { return }
+        if state.downloading { throw ICloudDownloadPending() }
+        do { try requestDownload(url) }
+        catch {
+            if isTemporaryDownloadError(error) { throw ICloudDownloadPending() }
+            // The canonical path can appear while the request is being sent.
+            guard isMissingFile(error), hasPlaceholder else { throw error }
         }
-        if let values = try? url.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey]), values.isUbiquitousItem == true, let status = values.ubiquitousItemDownloadingStatus, status != .current {
-            try FileManager.default.startDownloadingUbiquitousItem(at: url)
-            throw PasteImport.failure("iCloud 内容正在下载，请稍后重试")
+        if try fileInfo(placeholder) != nil || downloadStatus(url).pending || fileInfo(url) == nil {
+            throw ICloudDownloadPending()
+        }
+    }
+    private static func downloadPlaceholder(for url: URL) -> URL {
+        url.deletingLastPathComponent().appendingPathComponent("." + url.lastPathComponent + ".icloud")
+    }
+    private static func downloadState(of url: URL) throws -> DownloadState {
+        // Directory enumeration and repeated checks can leave stale URL resource values.
+        let freshURL = URL(fileURLWithPath: url.path, isDirectory: url.hasDirectoryPath)
+        let values: URLResourceValues
+        do {
+            values = try freshURL.resourceValues(forKeys: [.isUbiquitousItemKey, .ubiquitousItemDownloadingStatusKey,
+                .ubiquitousItemIsDownloadingKey, .ubiquitousItemDownloadingErrorKey])
+        } catch {
+            if isMissingFile(error) { return (false, false) }
+            if isTemporaryDownloadError(error) { return (true, false) }
+            throw error
+        }
+        if let error = values.ubiquitousItemDownloadingError, !isTemporaryDownloadError(error) { throw error }
+        let downloading = values.ubiquitousItemIsDownloading == true
+        let stale = values.isUbiquitousItem == true && values.ubiquitousItemDownloadingStatus.map { $0 != .current } == true
+        return (downloading || stale || values.ubiquitousItemDownloadingError != nil, downloading)
+    }
+    private static func isTemporaryDownloadError(_ error: Error) -> Bool {
+        let error = error as NSError
+        switch error.domain {
+        case NSCocoaErrorDomain:
+            if error.code == NSUbiquitousFileUnavailableError || error.code == NSUbiquitousFileUbiquityServerNotAvailable { return true }
+            if [NSFileReadUnknownError, NSFileReadNoSuchFileError, NSFileNoSuchFileError].contains(error.code),
+               let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError {
+                return isTemporaryDownloadError(underlying)
+            }
+            return false
+        case NSFileProviderErrorDomain:
+            if #available(macOS 14.1, *), error.code == NSFileProviderError.Code.providerDomainTemporarilyUnavailable.rawValue { return true }
+            return error.code == NSFileProviderError.Code.serverUnreachable.rawValue
+        case NSURLErrorDomain:
+            return [NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost, NSURLErrorTimedOut].contains(error.code)
+        default:
+            return false
+        }
+    }
+    private static func isMissingFile(_ error: Error) -> Bool {
+        let error = error as NSError
+        return (error.domain == NSCocoaErrorDomain && [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code)) ||
+            (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
+    }
+    private static func fileInfo(_ url: URL, followingSymlinks: Bool = false) throws -> stat? {
+        var info = stat()
+        let result = followingSymlinks ? stat(url.path, &info) : lstat(url.path, &info)
+        if result == 0 { return info }
+        let code = errno
+        if code == ENOENT { return nil }
+        throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+    }
+    private static func readyDirectory(_ url: URL, readiness: ReadinessCheck) throws {
+        var directory = url
+        while true {
+            try readiness(directory)
+            if try fileInfo(directory, followingSymlinks: true) != nil { return }
+            directory.deleteLastPathComponent()
         }
     }
     static func coordinated<T>(_ url: URL, writing: Bool, _ action: (URL) throws -> T) throws -> T {
@@ -61,17 +151,23 @@ enum DataDirectory {
         guard let result else { throw PasteImport.failure("无法访问数据目录") }
         return try result.get()
     }
-    static func manifests(_ root: URL) throws -> [URL] {
-        try ready(root)
-        let files = try FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey])
-        var pending: Error?
-        for file in files where file.lastPathComponent.hasPrefix(".device-") && file.lastPathComponent.hasSuffix(".json.icloud") {
-            let name = String(file.lastPathComponent.dropFirst().dropLast(7))
-            do { try ready(root.appendingPathComponent(name)) }
-            catch { if pending == nil { pending = error } }
+    static func manifests(_ root: URL, readiness: ReadinessCheck = DataDirectory.ready,
+                          includeLegacy: Bool = false, includeLegacyAlongsideDevices: Bool = false) throws -> [URL] {
+        try readiness(root)
+        let files = try FileManager.default.contentsOfDirectory(atPath: root.path)
+        let names = files.compactMap { name -> String? in
+            if name.hasPrefix("device-"), name.hasSuffix(".json") { return name }
+            if name.hasPrefix(".device-"), name.hasSuffix(".json.icloud") {
+                return String(name.dropFirst().dropLast(".icloud".count))
+            }
+            return nil
         }
-        if let pending { throw pending }
-        return files.filter { $0.lastPathComponent.hasPrefix("device-") && $0.pathExtension == "json" }.sorted { $0.path < $1.path }
+        var indexes = Set(names)
+        if includeLegacy, indexes.isEmpty || includeLegacyAlongsideDevices,
+           files.contains("history.json") || files.contains(".history.json.icloud") {
+            indexes.insert("history.json")
+        }
+        return indexes.sorted().map { root.appendingPathComponent($0, isDirectory: false) }
     }
     static func usesSync(_ root: URL) -> Bool {
         isCloud(root) || (try? FileManager.default.contentsOfDirectory(atPath: root.path).contains {
@@ -80,17 +176,30 @@ enum DataDirectory {
         }) == true
     }
     static func stamp(_ root: URL, manifestFiles: [URL]) throws -> String {
-        let files: [URL]
-        if manifestFiles.isEmpty {
-            let legacy = root.appendingPathComponent("history.json")
-            try ready(legacy)
-            files = FileManager.default.fileExists(atPath: legacy.path) ? [legacy] : []
-        } else {
-            files = manifestFiles
-        }
-        return try files.map { url in
-            let values = try url.resourceValues(forKeys: [.contentModificationDateKey, .fileSizeKey, .fileResourceIdentifierKey])
-            return "\(url.lastPathComponent):\(values.contentModificationDate?.timeIntervalSince1970 ?? 0):\(values.fileSize ?? 0):\(String(describing: values.fileResourceIdentifier))"
+        try stamp(manifestFiles.isEmpty ? [root.appendingPathComponent("history.json")] : manifestFiles,
+                  allowMissingLegacy: manifestFiles.isEmpty)
+    }
+    private static func stamp(_ candidates: [URL], allowMissingLegacy: Bool = false) throws -> String {
+        return try candidates.compactMap { url -> String? in
+            let placeholder = downloadPlaceholder(for: url)
+            let keys: Set<URLResourceKey> = [.contentModificationDateKey, .fileSizeKey, .fileResourceIdentifierKey]
+            var path = try fileInfo(placeholder) == nil ? url : placeholder
+            let values: URLResourceValues
+            do { values = try path.resourceValues(forKeys: keys) }
+            catch {
+                guard isMissingFile(error) else { throw error }
+                if path == placeholder {
+                    path = url
+                    values = try path.resourceValues(forKeys: keys)
+                } else if try fileInfo(placeholder) != nil {
+                    path = placeholder
+                    values = try path.resourceValues(forKeys: keys)
+                } else {
+                    if allowMissingLegacy { return nil }
+                    throw error
+                }
+            }
+            return "\(path.lastPathComponent):\(values.contentModificationDate?.timeIntervalSince1970 ?? 0):\(values.fileSize ?? 0):\(String(describing: values.fileResourceIdentifier))"
         }.joined(separator: "|")
     }
     static func clipSignature(_ clip: Clip) -> String {
@@ -159,82 +268,226 @@ enum DataDirectory {
     static func load(_ root: URL) throws -> SyncSnapshot {
         try load(root, manifestFiles: manifests(root))
     }
-    static func load(_ root: URL, manifestFiles files: [URL]) throws -> SyncSnapshot {
+    private static func loadLegacy(_ root: URL, readiness: ReadinessCheck, observed: DirectoryTargetHistory? = nil,
+                                   cloudAttachments: Bool? = nil) throws -> SyncSnapshot {
+        let url = root.appendingPathComponent("history.json")
+        for _ in 0..<2 {
+            if observed != nil, try fileInfo(url) != nil || fileInfo(downloadPlaceholder(for: url)) != nil { observed?.indexes.insert(url) }
+            try readiness(url)
+            if try fileInfo(url) != nil {
+                observed?.indexes.insert(url)
+                return try baseline(HistoryStorage.read(from: url, readiness: readiness, checkCloudAttachments: cloudAttachments))
+            }
+        }
+        guard observed?.indexes.contains(url) != true else { throw PasteImport.failure("目标历史清单已不可读，请重新选择目录") }
+        try readiness(root)
+        guard try fileInfo(root, followingSymlinks: true) != nil else { throw PasteImport.failure("无法读取数据目录") }
+        try readiness(root.appendingPathComponent("blobs", isDirectory: true))
+        return baseline(Archive())
+    }
+    static func load(_ root: URL, manifestFiles files: [URL], readiness: ReadinessCheck = DataDirectory.ready,
+                     requireListedFiles: Bool = false, cloudAttachments: Bool? = nil) throws -> SyncSnapshot {
         if files.isEmpty {
-            let url = root.appendingPathComponent("history.json")
-            try ready(url)
-            return try FileManager.default.fileExists(atPath: url.path) ? baseline(HistoryStorage.read(from: url)) : baseline(Archive())
+            return try loadLegacy(root, readiness: readiness, cloudAttachments: cloudAttachments)
         }
+        var pendingItems = Set<String>()
+        func check(_ url: URL) throws {
+            if pendingItems.contains(url.path) { throw ICloudDownloadPending() }
+            do { try checkedDownloadRead { try readiness(url) } }
+            catch let error as ICloudDownloadPending {
+                pendingItems.insert(url.path)
+                throw error
+            }
+        }
+        let readable = try files.filter { file in
+            do {
+                try check(file)
+                if requireListedFiles, try fileInfo(file) == nil {
+                    try check(file)
+                    guard try fileInfo(file) != nil else { throw PasteImport.failure("目标历史清单已不可读，请重新选择目录") }
+                }
+                return true
+            }
+            catch is ICloudDownloadPending { return false }
+        }
+        var pending = readable.count != files.count
         var snapshot = baseline(Archive())
-        for file in files {
-            let other = try coordinated(file, writing: false) { path -> SyncSnapshot in
-                try ready(path)
-                let archive = try HistoryStorage.read(from: path)
-                return SyncSnapshot(archive: archive, index: try HistoryStorage.syncIndex(from: path) ?? baseline(archive).index)
+        for file in readable {
+            do {
+                let other = try coordinated(file, writing: false) { path -> SyncSnapshot in
+                    let archive = try HistoryStorage.read(from: path, readiness: check, checkCloudAttachments: cloudAttachments)
+                    if file.lastPathComponent == "history.json" { return baseline(archive) }
+                    return SyncSnapshot(archive: archive, index: try HistoryStorage.syncIndex(from: path) ?? baseline(archive).index)
+                }
+                snapshot = merge(snapshot, other)
+            } catch is ICloudDownloadPending { pending = true }
+            catch let error {
+                // The item can be evicted between preflight and file coordination.
+                if isTemporaryDownloadError(error) { pending = true; continue }
+                guard isMissingFile(error) else { throw error }
+                do { try check(file) }
+                catch is ICloudDownloadPending { pending = true; continue }
+                throw error
             }
-            snapshot = merge(snapshot, other)
             // iCloud may retain a conflicting version when a device identity was cloned.
+            guard file.lastPathComponent != "history.json" else { continue }
             for version in NSFileVersion.unresolvedConflictVersionsOfItem(at: file) ?? [] {
-                let archive = try HistoryStorage.read(from: version.url, contentRoot: root)
-                snapshot = merge(snapshot, SyncSnapshot(archive: archive, index: try HistoryStorage.syncIndex(from: version.url) ?? baseline(archive).index))
+                do {
+                    let archive = try HistoryStorage.read(from: version.url, contentRoot: root, readiness: check, checkCloudAttachments: cloudAttachments)
+                    snapshot = merge(snapshot, SyncSnapshot(archive: archive, index: try HistoryStorage.syncIndex(from: version.url) ?? baseline(archive).index))
+                } catch is ICloudDownloadPending { pending = true }
+                catch { if isTemporaryDownloadError(error) { pending = true } else { throw error } }
             }
         }
+        if pending { throw ICloudDownloadPending() }
         return snapshot
     }
-    static func loadRecoveryTarget(_ root: URL) throws -> SyncSnapshot {
-        var isDirectory: ObjCBool = false
-        let exists = FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory)
-        if exists, !isDirectory.boolValue { throw PasteImport.failure("目标路径不是文件夹") }
-        var snapshot: SyncSnapshot
-        if exists {
-            let files = try manifests(root)
-            snapshot = try load(root, manifestFiles: files)
-        } else {
-            snapshot = baseline(Archive())
+    private static func checkedDownloadRead<T>(_ read: () throws -> T) throws -> T {
+        do { return try read() }
+        catch {
+            if isTemporaryDownloadError(error) { throw ICloudDownloadPending() }
+            throw error
         }
-        if let cached = try cached(root) { snapshot = merge(snapshot, cached) }
-        return snapshot
+    }
+    fileprivate static func loadTarget(_ root: URL, cloud: Bool, readiness: ReadinessCheck, observed: DirectoryTargetHistory? = nil,
+                                       manifestEnumerator: ((URL) throws -> [URL])? = nil, verifyStable: Bool = false) throws -> DirectoryTarget {
+        do { try checkedDownloadRead { try readyDirectory(root, readiness: readiness) } }
+        catch is ICloudDownloadPending {
+            observed?.existed = true
+            throw ICloudDownloadPending()
+        }
+        guard let info = try fileInfo(root, followingSymlinks: true) else {
+            if cloud || observed?.existed == true {
+                try checkedDownloadRead { try readiness(root) }
+                throw PasteImport.failure("无法读取目标目录，请重新选择")
+            }
+            return DirectoryTarget(snapshot: baseline(Archive()), hasDeviceManifests: false, exists: false, stamp: nil, watchesLegacy: true)
+        }
+        guard info.st_mode & S_IFMT == S_IFDIR else { throw PasteImport.failure("目标路径不是文件夹") }
+        observed?.existed = true
+        let legacyWasObserved = observed?.indexes.contains { $0.lastPathComponent == "history.json" } == true
+        let files = try checkedDownloadRead {
+            try manifestEnumerator?(root) ?? manifests(root, readiness: readiness, includeLegacy: true,
+                                                       includeLegacyAlongsideDevices: legacyWasObserved)
+        }
+        observed?.indexes.formUnion(files)
+        let indexes = (observed?.indexes ?? Set(files)).sorted { $0.path < $1.path }
+        let hasDeviceManifests = indexes.contains { $0.lastPathComponent != "history.json" }
+        let watchesLegacy = !hasDeviceManifests || indexes.contains { $0.lastPathComponent == "history.json" }
+        let before = verifyStable ? try checkedDownloadRead { try stamp(files) } : nil
+        let snapshot = try checkedDownloadRead {
+            if indexes.isEmpty {
+                return try loadLegacy(root, readiness: readiness, observed: observed, cloudAttachments: cloud ? true : nil)
+            }
+            return try load(root, manifestFiles: indexes, readiness: readiness, requireListedFiles: true, cloudAttachments: cloud ? true : nil)
+        }
+        try checkedDownloadRead { try readiness(root.appendingPathComponent("blobs", isDirectory: true)) }
+        if let before {
+            let current = try migrationStamp(root, readiness: readiness, watchesLegacy: watchesLegacy, observed: observed)
+            if current != before { throw DirectoryTargetChanged() }
+        }
+        return DirectoryTarget(snapshot: snapshot, hasDeviceManifests: hasDeviceManifests, exists: true, stamp: before, watchesLegacy: watchesLegacy)
+    }
+    private static func migrationStamp(_ root: URL, readiness: ReadinessCheck, watchesLegacy: Bool, observed: DirectoryTargetHistory?) throws -> String {
+        try checkedDownloadRead {
+            let files = try manifests(root, readiness: readiness, includeLegacy: watchesLegacy, includeLegacyAlongsideDevices: watchesLegacy)
+            observed?.indexes.formUnion(files)
+            var pending = false
+            for file in files {
+                do { try checkedDownloadRead { try readiness(file) } }
+                catch is ICloudDownloadPending { pending = true }
+            }
+            if pending { throw ICloudDownloadPending() }
+            try readiness(root.appendingPathComponent("blobs", isDirectory: true))
+            return try stamp(files)
+        }
+    }
+    static func loadRecoveryTarget(_ root: URL, cloud: Bool? = nil, readiness: ReadinessCheck = DataDirectory.ready) throws -> SyncSnapshot {
+        try recoverySnapshot(root, cloud: cloud ?? isCloud(root), readiness: readiness).0
+    }
+    fileprivate static func recoverySnapshot(_ root: URL, cloud: Bool, readiness: ReadinessCheck, observed: DirectoryTargetHistory? = nil) throws -> (SyncSnapshot, Bool) {
+        let target = try loadTarget(root, cloud: cloud, readiness: readiness, observed: observed)
+        let shared = cloud || target.hasDeviceManifests
+        if let cached = try cached(root) { return (merge(target.snapshot, cached), shared) }
+        return (target.snapshot, shared)
     }
     static func write(_ snapshot: SyncSnapshot, root: URL, device: String, progress: ((ImportProgress) -> Void)? = nil) throws {
         let url = root.appendingPathComponent("device-\(device).json")
         try coordinated(url, writing: true) { path in try HistoryStorage.write(snapshot.archive, to: path, phase: "保存同步历史", progress: progress, sync: snapshot.index) }
     }
-    static func migrate(_ archive: Archive, from source: URL, to destination: URL, device: @autoclosure () -> String, environment: AppEnvironment = .current, destinationIsCloud: Bool? = nil, manifestEnumerator: (URL) throws -> [URL] = DataDirectory.manifests, progress: ((ImportProgress) -> Void)? = nil) throws -> SyncSnapshot {
+    static func validateDestination(_ destination: URL, from source: URL, environment: AppEnvironment) throws -> URL {
         let source = try environment.validateDataRoot(source).standardizedFileURL.resolvingSymlinksInPath()
         let destination = try environment.validateDataRoot(destination).standardizedFileURL.resolvingSymlinksInPath()
         guard destination.path != source.path, !destination.path.hasPrefix(source.path + "/"), !source.path.hasPrefix(destination.path + "/") else { throw PasteImport.failure("请选择独立的数据文件夹，不能使用当前目录或它的上级、子目录") }
-        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
-        _ = try environment.validateDataRoot(destination)
+        return destination
+    }
+    static func migrate(_ archive: Archive, from source: URL, to destination: URL, device: @autoclosure () -> String, environment: AppEnvironment = .current, destinationIsCloud: Bool? = nil, readiness: ReadinessCheck = DataDirectory.ready, manifestEnumerator: ((URL) throws -> [URL])? = nil, progress: ((ImportProgress) -> Void)? = nil) throws -> SyncSnapshot {
+        try migrateSnapshot(archive, from: source, to: destination, device: device, environment: environment, destinationIsCloud: destinationIsCloud,
+                            readiness: readiness, manifestEnumerator: manifestEnumerator, progress: progress).0
+    }
+    fileprivate static func migrateSnapshot(_ archive: Archive, from source: URL, to destination: URL, device: () -> String, environment: AppEnvironment, destinationIsCloud: Bool?, readiness: ReadinessCheck, observed: DirectoryTargetHistory? = nil, manifestEnumerator: ((URL) throws -> [URL])? = nil, progress: ((ImportProgress) -> Void)?) throws -> (SyncSnapshot, Bool) {
+        let destination = try validateDestination(destination, from: source, environment: environment)
         let cloudDestination = destinationIsCloud ?? isCloud(destination)
-        var existing = try load(destination)
-        let files = try manifestEnumerator(destination)
-        if (cloudDestination || !files.isEmpty), let cached = try cached(destination) { existing = merge(existing, cached) }
+        var target = try loadTarget(destination, cloud: cloudDestination, readiness: readiness, observed: observed,
+                                    manifestEnumerator: manifestEnumerator, verifyStable: true)
+        var existing = target.snapshot
+        let shared = cloudDestination || target.hasDeviceManifests
+        if shared, let cached = try cached(destination) { existing = merge(existing, cached) }
+        if !target.exists {
+            try readyDirectory(destination, readiness: readiness)
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            target = try loadTarget(destination, cloud: cloudDestination, readiness: readiness, observed: observed, verifyStable: true)
+            guard target.stamp == "" else {
+                throw DirectoryTargetChanged()
+            }
+        }
+        _ = try environment.validateDataRoot(destination)
         let local = changes(archive, from: baseline(Archive()))
         let merged = merge(existing, local)
         // The source remains a complete backup; also snapshot destination before changing it.
         let history = destination.appendingPathComponent("history.json")
         let backup = destination.appendingPathComponent("before-directory-change-\(UUID()).json")
-        if !files.isEmpty {
-            try HistoryStorage.write(existing.archive, to: backup, phase: "备份目标历史", progress: progress, sync: existing.index)
-        } else if FileManager.default.fileExists(atPath: history.path) {
-            try FileManager.default.copyItem(at: history, to: backup)
-        }
         let stagingManifest = destination.appendingPathComponent("migration-\(UUID()).json")
         defer { try? FileManager.default.removeItem(at: stagingManifest) }
         try HistoryStorage.write(merged.archive, to: stagingManifest, phase: "迁移历史与附件", progress: progress, sync: merged.index)
-        let verified = try HistoryStorage.read(from: stagingManifest)
+        let verified = try checkedDownloadRead { try HistoryStorage.read(from: stagingManifest, readiness: readiness) }
         guard verified.clips.count == merged.archive.clips.count else { throw PasteImport.failure("迁移校验失败") }
-        let shared = cloudDestination || !files.isEmpty
+        if target.hasDeviceManifests {
+            try HistoryStorage.write(existing.archive, to: backup, phase: "备份目标历史", progress: progress, sync: existing.index)
+        } else if target.stamp != "" {
+            try checkedDownloadRead {
+                try readiness(history)
+                do { try FileManager.default.copyItem(at: history, to: backup) }
+                catch {
+                    try readiness(history)
+                    throw error
+                }
+            }
+        }
+        let currentStamp = try migrationStamp(destination, readiness: readiness, watchesLegacy: target.watchesLegacy, observed: observed)
+        guard currentStamp == target.stamp else { throw DirectoryTargetChanged() }
         if shared { try write(merged, root: destination, device: device()); try cache(merged, root: destination) }
         else { try coordinated(history, writing: true) { path in try HistoryStorage.write(merged.archive, to: path) } }
-        return SyncSnapshot(archive: verified, index: merged.index)
+        return (SyncSnapshot(archive: verified, index: merged.index), shared)
     }
+}
+
+private struct DirectoryChange {
+    let id = UUID()
+    let source: URL
+    let destination: URL
+    let environment: AppEnvironment
+    let requiresICloud: Bool
+    let readiness: DataDirectory.ReadinessCheck
+    let willReadForMigration: (() throws -> Void)?
+    let queue = DispatchQueue(label: "openpaste.directory-check", qos: .utility)
+    let targetHistory = DirectoryTargetHistory()
 }
 
 extension Store {
     var storageDescription: String { isICloudDirectory ? "由 iCloud Drive 同步" : "保存在所选目录" }
     func chooseICloudDirectory() {
-        guard !changingDataDirectory, !importingPaste, !ephemeral else { return }
+        guard !directoryChangeInProgress, !importingPaste, !ephemeral else { return }
         guard !AppEnvironment.current.acceptanceMode else {
             directoryStatus = "切换失败：当前验收配置只能使用隔离的本机目录。"
             return
@@ -244,7 +497,7 @@ extension Store {
             let available = FileManager.default.ubiquityIdentityToken != nil &&
                 FileManager.default.fileExists(atPath: cloudRoot.path)
             DispatchQueue.main.async {
-                guard !self.changingDataDirectory, !self.importingPaste else { return }
+                guard !self.directoryChangeInProgress, !self.importingPaste else { return }
                 guard available else {
                     self.directoryStatus = "切换失败：iCloud Drive 不可用。请在系统设置登录 Apple 账户并开启 iCloud Drive 后重试。"
                     return
@@ -255,7 +508,7 @@ extension Store {
     }
     func chooseDataDirectory() { presentDataDirectoryPicker(startingAt: root, requiresICloud: false) }
     private func presentDataDirectoryPicker(startingAt initialDirectory: URL, requiresICloud: Bool) {
-        guard !changingDataDirectory, !importingPaste else { return }
+        guard !directoryChangeInProgress, !importingPaste else { return }
         guard let parent = Controller.shared.settingsWindow, parent.attachedSheet == nil else { return }
         let picker = NSOpenPanel()
         picker.title = requiresICloud ? "选择 iCloud Drive 中的专用文件夹" : "选择历史数据目录"
@@ -266,58 +519,110 @@ extension Store {
             if response == .OK, let url = picker.url { self.changeDataDirectory(to: url, requiresICloud: requiresICloud) }
         }
     }
-    func changeDataDirectory(to destination: URL, environment: AppEnvironment = .current, requiresICloud: Bool = false) {
-        guard !ephemeral, !changingDataDirectory, !importingPaste else { return }
-        let validatedDestination: URL
-        do {
-            validatedDestination = try environment.validateDataRoot(destination).standardizedFileURL.resolvingSymlinksInPath()
-            let source = try environment.validateDataRoot(root).standardizedFileURL.resolvingSymlinksInPath()
-            guard validatedDestination.path != source.path,
-                  !validatedDestination.path.hasPrefix(source.path + "/"),
-                  !source.path.hasPrefix(validatedDestination.path + "/") else {
-                throw PasteImport.failure("请选择独立的数据文件夹，不能使用当前目录或它的上级、子目录")
+    func changeDataDirectory(to destination: URL, environment: AppEnvironment = .current, requiresICloud: Bool = false,
+                             readiness: @escaping DataDirectory.ReadinessCheck = DataDirectory.ready,
+                             willReadForMigration: (() throws -> Void)? = nil) {
+        guard !ephemeral, !initialLoading, !directoryChangeInProgress, !importingPaste else { return }
+        let change = DirectoryChange(source: root, destination: destination, environment: environment,
+                                     requiresICloud: requiresICloud, readiness: readiness, willReadForMigration: willReadForMigration)
+        directoryChangeID = change.id
+        directoryStatus = "正在检查所选目录，继续使用原目录…"
+        checkDirectoryChange(change)
+    }
+    func cancelDataDirectoryChange() {
+        guard canCancelDirectoryChange else { return }
+        directoryChangeID = nil
+        directoryStatus = "已取消切换，继续使用原目录。"
+    }
+    private func isCurrent(_ change: DirectoryChange) -> Bool {
+        directoryChangeID == change.id && root == change.source
+    }
+    private func checkDirectoryChange(_ change: DirectoryChange, retryDelay: TimeInterval = 1) {
+        change.queue.async { [weak self] in
+            let result = Result { () throws -> (URL, Bool) in
+                let target = try DataDirectory.validateDestination(change.destination, from: change.source, environment: change.environment)
+                let cloud = DataDirectory.isCloud(target)
+                if change.requiresICloud && (!cloud || target.path == DataDirectory.iCloudDriveRoot.path) {
+                    throw PasteImport.failure("请选择 iCloud Drive 中专用于剪贴板历史的子文件夹")
+                }
+                _ = try DataDirectory.loadTarget(target, cloud: cloud, readiness: change.readiness, observed: change.targetHistory)
+                return (target, cloud)
+            }
+            DispatchQueue.main.async {
+                guard let self, self.isCurrent(change) else { return }
+                switch result {
+                case .success(let (target, cloud)):
+                    self.prepareDirectoryMigration(change, target: target, cloud: cloud, retryDelay: retryDelay)
+                case .failure(is ICloudDownloadPending):
+                    self.waitForDirectoryDownload(change, delay: retryDelay)
+                case .failure(let error):
+                    self.directoryChangeID = nil
+                    self.directoryStatus = "切换失败：\(error.localizedDescription)。仍使用原目录。"
+                }
             }
         }
-        catch { directoryStatus = "切换失败：\(error.localizedDescription)。仍使用原目录。"; return }
+    }
+    private func waitForDirectoryDownload(_ change: DirectoryChange, delay: TimeInterval) {
+        let status = "iCloud 内容正在下载，完成后将自动切换。当前继续使用原目录。"
+        if directoryStatus != status { directoryStatus = status }
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.isCurrent(change) else { return }
+            self.checkDirectoryChange(change, retryDelay: min(delay * 2, 15))
+        }
+    }
+    private func resumeAfterDirectoryMigration(recovering: Bool) {
+        directoryProgress = ImportProgress(phase: "", completed: 0, total: 0)
+        changingDataDirectory = false
+        endTemporaryPause()
+        if !recovering { save() }
+    }
+    private func prepareDirectoryMigration(_ change: DirectoryChange, target: URL, cloud: Bool, retryDelay: TimeInterval) {
+        guard !initialLoading, !changingDataDirectory, !importingPaste, !savePending, !syncChecking else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                guard let self, self.isCurrent(change) else { return }
+                self.prepareDirectoryMigration(change, target: target, cloud: cloud, retryDelay: retryDelay)
+            }
+            return
+        }
         let recoveringFromLoadFailure = hasHistoryLoadFailure
         // Finish capture while recording still has its previous state; then freeze migration.
         captureQueue.sync {}
         finishDirectoryCapture()
-        invalidatePendingStorageCallbacks()
+        // A save queued while finishing capture still needs to reach the original directory.
+        invalidatePendingStorageCallbacks(keepingQueuedSave: true)
         let operationGeneration = directoryMutation
         changingDataDirectory = true
         beginTemporaryPause()
         directoryStatus = recoveringFromLoadFailure ? "正在读取目标目录，损坏的原目录不会迁移…" : "正在迁移，原目录会保留…"
         directoryProgress = ImportProgress(phase: recoveringFromLoadFailure ? "读取目标目录" : "准备迁移", completed: 0, total: recoveringFromLoadFailure ? 0 : archive.clips.count)
-        let snapshot = archive, source = root
+        let snapshot = archive
         persistenceQueue.async {
-            let result = Result { () throws -> (SyncSnapshot, Bool, Bool) in
-                let destinationIsCloud = DataDirectory.isCloud(validatedDestination)
-                if requiresICloud && (!destinationIsCloud || validatedDestination.path == DataDirectory.iCloudDriveRoot.path) {
-                    throw PasteImport.failure("请选择 iCloud Drive 中专用于剪贴板历史的子文件夹")
-                }
-                let destinationIsShared = destinationIsCloud || DataDirectory.usesSync(validatedDestination)
+            let result = Result { () throws -> (SyncSnapshot, Bool) in
+                try change.willReadForMigration?()
                 if recoveringFromLoadFailure {
-                    return (try DataDirectory.loadRecoveryTarget(validatedDestination), destinationIsCloud, destinationIsShared)
+                    let validated = try DataDirectory.validateDestination(target, from: change.source, environment: change.environment)
+                    return try DataDirectory.recoverySnapshot(validated, cloud: cloud, readiness: change.readiness, observed: change.targetHistory)
                 }
-                return (try DataDirectory.migrate(snapshot, from: source, to: validatedDestination, device: self.deviceIDForPersistence(), environment: environment, destinationIsCloud: destinationIsCloud, progress: { progress in
+                return try DataDirectory.migrateSnapshot(snapshot, from: change.source, to: target, device: self.deviceIDForPersistence,
+                                                         environment: change.environment, destinationIsCloud: cloud, readiness: change.readiness,
+                                                         observed: change.targetHistory, progress: { progress in
                     DispatchQueue.main.async {
-                        guard self.root.standardizedFileURL == source.standardizedFileURL,
+                        guard self.isCurrent(change),
                               self.directoryMutation == operationGeneration,
                               self.changingDataDirectory else { return }
                         self.directoryProgress = progress
                     }
-                }), destinationIsCloud, destinationIsShared)
+                })
             }
             DispatchQueue.main.async {
-                guard self.root.standardizedFileURL == source.standardizedFileURL,
+                guard self.isCurrent(change),
                       self.directoryMutation == operationGeneration,
                       self.changingDataDirectory else { return }
                 var completedRecovery = false
                 switch result {
-                case .success(let (migrated, destinationIsCloud, destinationIsShared)):
-                    self.root = validatedDestination.standardizedFileURL
-                    self.isICloudDirectory = destinationIsCloud
+                case .success(let (migrated, destinationIsShared)):
+                    self.root = target.standardizedFileURL
+                    self.isICloudDirectory = cloud
                     self.usesSharedDirectory = destinationIsShared
                     self.syncBaseline = migrated
                     self.syncStamp = nil
@@ -332,8 +637,18 @@ extension Store {
                     self.setRecordingLoadFailure(nil)
                     self.setRecordingSaveFailure(nil)
                     completedRecovery = recoveringFromLoadFailure
+                case .failure(is ICloudDownloadPending):
+                    self.resumeAfterDirectoryMigration(recovering: recoveringFromLoadFailure)
+                    self.waitForDirectoryDownload(change, delay: retryDelay)
+                    return
+                case .failure(is DirectoryTargetChanged):
+                    self.resumeAfterDirectoryMigration(recovering: recoveringFromLoadFailure)
+                    self.directoryStatus = "目标目录有更新，正在重新检查。当前继续使用原目录。"
+                    self.checkDirectoryChange(change, retryDelay: retryDelay)
+                    return
                 case .failure(let error): self.directoryStatus = "切换失败：\(error.localizedDescription)。仍使用原目录。"
                 }
+                self.directoryChangeID = nil
                 self.changingDataDirectory = false; self.endTemporaryPause()
                 if completedRecovery { self.resumeDeferredInitialStart() }
                 else if !recoveringFromLoadFailure { self.save() }
@@ -534,13 +849,13 @@ func runDataDirectoryTests() {
         let migratingStore = Store(root: localRoot); migratingStore.ingest(clip("真实迁移工作流")); migratingStore.flush()
         migratingStore.changeDataDirectory(to: newRoot)
         var deadline = Date().addingTimeInterval(8)
-        while migratingStore.changingDataDirectory && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+        while migratingStore.directoryChangeInProgress && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
         migratingStore.flush()
-        check(migratingStore.root.path == newRoot.path && !migratingStore.changingDataDirectory, "Store 异步迁移后切换目录")
+        check(migratingStore.root.path == newRoot.path && !migratingStore.directoryChangeInProgress, "Store 异步迁移后切换目录")
         check(Store(root: newRoot).archive.clips.count == 1, "Store 重启读取新目录")
         migratingStore.changeDataDirectory(to: broken)
         deadline = Date().addingTimeInterval(8)
-        while migratingStore.changingDataDirectory && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+        while migratingStore.directoryChangeInProgress && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
         migratingStore.flush()
         check(migratingStore.root.path == newRoot.path && migratingStore.directoryStatus.hasPrefix("切换失败"), "Store 迁移失败恢复原目录与状态")
         let pollRoot = sandbox.appendingPathComponent("poll-local")
@@ -580,7 +895,9 @@ func runDataDirectoryTests() {
         let outsideAcceptance = sandbox.appendingPathComponent("outside-acceptance")
         let acceptanceStore = Store(root: acceptanceSource)
         acceptanceStore.changeDataDirectory(to: outsideAcceptance, environment: acceptanceEnvironment)
-        check(acceptanceStore.root == acceptanceSource && !acceptanceStore.changingDataDirectory && acceptanceStore.directoryStatus.hasPrefix("切换失败"), "验收目录越界失败时不切换 Store 根目录")
+        deadline = Date().addingTimeInterval(2)
+        while acceptanceStore.directoryChangeInProgress && Date() < deadline { RunLoop.main.run(until: Date().addingTimeInterval(0.02)) }
+        check(acceptanceStore.root == acceptanceSource && !acceptanceStore.directoryChangeInProgress && acceptanceStore.directoryStatus.hasPrefix("切换失败"), "验收目录越界失败时不切换 Store 根目录")
         do {
             _ = try DataDirectory.migrate(Archive(), from: acceptanceSource, to: outsideAcceptance, device: "A", environment: acceptanceEnvironment)
             check(false, "迁移入口拒绝验收根目录外目标")
@@ -598,6 +915,175 @@ func runDataDirectoryTests() {
         let id = HistoryStorage.digest(a.parts[0][0].data)
         try fm.removeItem(at: shared.appendingPathComponent("blobs").appendingPathComponent(id))
         do { _ = try DataDirectory.load(shared); check(false, "缺失附件阻止覆盖") } catch { check(fm.fileExists(atPath: manifest.path), "缺失附件阻止空历史覆盖") }
+
+        func placeholder(_ item: URL) -> URL {
+            item.deletingLastPathComponent().appendingPathComponent(".\(item.lastPathComponent).icloud")
+        }
+        func expectDownload(_ read: () throws -> Void, _ label: String) throws {
+            do { try read(); check(false, label) }
+            catch is ICloudDownloadPending { check(true, label) }
+        }
+        let pendingRoot = sandbox.appendingPathComponent("directory-placeholder")
+        let rootStub = placeholder(pendingRoot)
+        try Data().write(to: rootStub)
+        let pendingRootReadiness: DataDirectory.ReadinessCheck = { try DataDirectory.ready($0, requestDownload: { _ in }) }
+        try expectDownload({
+            _ = try DataDirectory.loadRecoveryTarget(pendingRoot, readiness: pendingRootReadiness)
+        }, "恢复目标识别整个数据目录占位文件")
+        try expectDownload({
+            _ = try DataDirectory.migrate(Archive(clips: [a]), from: source, to: pendingRoot, device: "A", readiness: pendingRootReadiness)
+        }, "迁移不会创建仍在下载的目标目录")
+        check(fm.fileExists(atPath: rootStub.path) && !fm.fileExists(atPath: pendingRoot.path), "目标目录占位保持完好")
+        try expectDownload({
+            _ = try DataDirectory.migrate(Archive(clips: [a]), from: source, to: pendingRoot.appendingPathComponent("child"), device: "A", readiness: pendingRootReadiness)
+        }, "创建子目录前检查其尚未下载的父目录")
+        try expectDownload({
+            try DataDirectory.ready(pendingRoot) { _ in throw NSError(domain: NSCocoaErrorDomain, code: NSUbiquitousFileUnavailableError) }
+        }, "其他设备尚未上传的占位仍处于等待状态")
+        do {
+            try DataDirectory.ready(pendingRoot) { _ in throw POSIXError(.EACCES) }
+            check(false, "下载请求的权限错误必须终止切换")
+        } catch let error as POSIXError {
+            check(error.code == .EACCES, "下载请求的权限错误必须终止切换")
+        }
+        do {
+            _ = try DataDirectory.loadRecoveryTarget(sandbox.appendingPathComponent("absent-cloud-target"), cloud: true)
+            check(false, "消失的 iCloud 目录不能按空目录切换")
+        } catch {
+            check(!(error is ICloudDownloadPending) && error.localizedDescription.contains("无法读取目标目录"),
+                  "无下载证据时消失的 iCloud 目录是明确失败")
+        }
+
+        let batchRoot = sandbox.appendingPathComponent("download-batch")
+        let items = [clip("批量附件一"), clip("批量附件二"), clip("批量附件三")]
+        try DataDirectory.write(DataDirectory.baseline(Archive(clips: Array(items.prefix(2)))), root: batchRoot, device: "ready-a")
+        try DataDirectory.write(DataDirectory.baseline(Archive(clips: Array(items.suffix(1)))), root: batchRoot, device: "ready-b")
+        let pendingManifests = ["pending-a", "pending-b"].map { batchRoot.appendingPathComponent("device-\($0).json") }
+        for url in pendingManifests { try Data().write(to: placeholder(url)) }
+        let blobsFolder = batchRoot.appendingPathComponent("blobs", isDirectory: true)
+        let pendingBlobs = items.map { blobsFolder.appendingPathComponent(HistoryStorage.digest($0.parts[0][0].data)) }
+        for url in pendingBlobs { try fm.moveItem(at: url, to: placeholder(url)) }
+        var requests: [String] = []
+        let captureDownloadRequest: DataDirectory.ReadinessCheck = { url in
+            try DataDirectory.ready(url) { requests.append($0.path) }
+        }
+        try expectDownload({
+            _ = try DataDirectory.load(batchRoot, manifestFiles: DataDirectory.manifests(batchRoot), readiness: captureDownloadRequest)
+        }, "任一清单或附件待下载时不返回部分历史")
+        check(requests.count == 5 && Set(requests) == Set((pendingManifests + pendingBlobs).map(\.path)),
+              "同一轮请求所有已知设备清单及附件的下载")
+        try fm.removeItem(at: placeholder(pendingBlobs[0]))
+        do {
+            _ = try DataDirectory.load(batchRoot, manifestFiles: DataDirectory.manifests(batchRoot), readiness: captureDownloadRequest)
+            check(false, "有其他等待项时也不能掩盖无占位的缺失附件")
+        } catch {
+            check(!(error is ICloudDownloadPending) && error.localizedDescription.contains("历史内容文件缺失或损坏"),
+                  "有其他等待项时也不能掩盖无占位的缺失附件")
+        }
+        let folderStub = placeholder(blobsFolder)
+        try fm.moveItem(at: blobsFolder, to: folderStub)
+        try expectDownload({
+            _ = try HistoryStorage.read(from: batchRoot.appendingPathComponent("device-ready-a.json"), readiness: captureDownloadRequest)
+        }, "附件目录占位不会当成附件损坏或空历史")
+        try expectDownload({
+            _ = try DataDirectory.migrate(Archive(clips: [a]), from: source, to: batchRoot, device: "A", readiness: captureDownloadRequest)
+        }, "迁移不会创建仍在下载的附件目录")
+        check(!fm.fileExists(atPath: blobsFolder.path), "迁移等待期间不会覆盖附件目录占位")
+
+        let materializingRoot = sandbox.appendingPathComponent("materializing")
+        try fm.createDirectory(at: materializingRoot, withIntermediateDirectories: true)
+        let materializingManifest = materializingRoot.appendingPathComponent("device-remote.json")
+        let materializingStub = placeholder(materializingManifest)
+        try Data().write(to: materializingStub)
+        let materializingFiles = try DataDirectory.manifests(materializingRoot)
+        let materialized = try DataDirectory.load(materializingRoot, manifestFiles: materializingFiles, readiness: { url in
+            try DataDirectory.ready(url) { url in
+                guard url == materializingManifest else { throw PasteImport.failure("unexpected fixture download") }
+                try DataDirectory.write(DataDirectory.baseline(Archive(clips: [b])), root: materializingRoot, device: "remote")
+                try fm.removeItem(at: materializingStub)
+                throw CocoaError(.fileReadNoSuchFile)
+            }
+        })
+        check(materialized.archive.clips.map(\.id) == [b.id], "枚举占位、读取前转正的清单仍会完整合并")
+        try Data().write(to: materializingStub)
+        check(try DataDirectory.manifests(materializingRoot).map(\.path) == [materializingManifest.path],
+              "同批枚举的占位和实际清单只计一次")
+
+        let emptyTargetWithBlobStub = sandbox.appendingPathComponent("empty-index-pending-blobs")
+        try fm.createDirectory(at: emptyTargetWithBlobStub, withIntermediateDirectories: true)
+        try Data().write(to: placeholder(emptyTargetWithBlobStub.appendingPathComponent("blobs", isDirectory: true)))
+        try expectDownload({
+            _ = try DataDirectory.loadRecoveryTarget(emptyTargetWithBlobStub, readiness: pendingRootReadiness)
+        }, "没有索引时也识别附件目录的占位")
+
+        let compatibilityTarget = sandbox.appendingPathComponent("legacy-migration")
+        try fm.createDirectory(at: compatibilityTarget, withIntermediateDirectories: true)
+        try JSONEncoder().encode(Archive(clips: [b])).write(to: compatibilityTarget.appendingPathComponent("history.json"))
+        let compatibilityMigration = try DataDirectory.migrate(Archive(clips: [a]), from: source, to: compatibilityTarget, device: "A")
+        check(Set(compatibilityMigration.archive.clips.map(\.id)) == Set([a.id, b.id]), "目录切换兼容内嵌附件的旧格式索引")
+
+        for name in ["device-remote.json", "history.json"] {
+            let disappearing = sandbox.appendingPathComponent("temporarily-missing-\(name)")
+            let listed = disappearing.appendingPathComponent(name)
+            try HistoryStorage.write(Archive(clips: [b]), to: listed, sync: DataDirectory.baseline(Archive(clips: [b])).index)
+            let observed = DirectoryTargetHistory()
+            _ = try DataDirectory.loadTarget(disappearing, cloud: false, readiness: DataDirectory.ready, observed: observed)
+            try fm.removeItem(at: listed)
+            do {
+                _ = try DataDirectory.migrateSnapshot(Archive(clips: [a]), from: source, to: disappearing, device: { "A" },
+                                                     environment: .current, destinationIsCloud: false, readiness: DataDirectory.ready,
+                                                     observed: observed, progress: nil)
+                check(false, "清单暂时消失时拒绝迁移 \(name)")
+            } catch {
+                check(!fm.fileExists(atPath: listed.path) && !fm.fileExists(atPath: disappearing.appendingPathComponent("device-A.json").path),
+                      "已见 \(name) 消失后不会按空历史发布")
+            }
+        }
+        try expectDownload({
+            _ = try DataDirectory.loadTarget(materializingRoot, cloud: false, readiness: DataDirectory.ready, manifestEnumerator: { _ in
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileReadUnknownError, userInfo: [
+                    NSUnderlyingErrorKey: NSError(domain: NSFileProviderErrorDomain, code: NSFileProviderError.Code.serverUnreachable.rawValue)
+                ])
+            })
+        }, "目录枚举报告服务暂不可达时进入等待，即使路径当前可用")
+
+        let datalessRoot = sandbox.appendingPathComponent("dataless-items")
+        try DataDirectory.write(DataDirectory.baseline(Archive(clips: [a, b])), root: datalessRoot, device: "downloaded-index")
+        try DataDirectory.write(DataDirectory.baseline(Archive()), root: datalessRoot, device: "dataless-index")
+        let datalessIndex = datalessRoot.appendingPathComponent("device-dataless-index.json").path
+        let datalessBlobs = [a, b].map {
+            datalessRoot.appendingPathComponent("blobs").appendingPathComponent(HistoryStorage.digest($0.parts[0][0].data)).path
+        }
+        let datalessItems = Set([datalessIndex] + datalessBlobs)
+        var datalessRequests = Set<String>()
+        try expectDownload({
+            _ = try DataDirectory.loadTarget(datalessRoot, cloud: true, readiness: { url in
+                try DataDirectory.ready(url, downloadStatus: { (datalessItems.contains($0.path), false) }) {
+                    datalessRequests.insert($0.path)
+                }
+            })
+        }, "有实际路径的 File Provider 文件仍需等待下载")
+        check(datalessRequests == datalessItems, "同一轮请求没有 .icloud 扩展名的清单及所有已知附件")
+
+        let stagingTarget = sandbox.appendingPathComponent("migration-staging-race")
+        let stagingHistory = stagingTarget.appendingPathComponent("history.json")
+        let stagingRemote = stagingTarget.appendingPathComponent("device-late.json")
+        let stagingPlaceholder = placeholder(stagingRemote)
+        try HistoryStorage.write(Archive(clips: [b]), to: stagingHistory)
+        let stagingHash = HistoryStorage.digest(try Data(contentsOf: stagingHistory))
+        var wrotePlaceholder = false
+        try expectDownload({
+            _ = try DataDirectory.migrate(Archive(clips: [a]), from: source, to: stagingTarget, device: "A",
+                                           readiness: captureDownloadRequest, progress: { progress in
+                if progress.phase == "迁移历史与附件", !wrotePlaceholder {
+                    do { try Data().write(to: stagingPlaceholder); wrotePlaceholder = true }
+                    catch { print("FAIL: 创建迁移期间新到的占位 \(error)"); exit(1) }
+                }
+            })
+        }, "写入暂存数据时到达的新占位触发重新等待")
+        let finalStagingHash = HistoryStorage.digest(try Data(contentsOf: stagingHistory))
+        check(wrotePlaceholder && finalStagingHash == stagingHash,
+              "最终复核发现新占位后不覆盖原活动索引")
         print("Data directory: \(passed) checks passed")
     } catch { print("FAIL: \(error)"); exit(1) }
 }

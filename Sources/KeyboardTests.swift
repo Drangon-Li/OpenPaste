@@ -444,7 +444,7 @@ func runPreviewToggleTests(controller: Controller) async {
     var maxWarmOpenMilliseconds = 0.0
     var maxCloseMilliseconds = 0.0
     var maxReverseMilliseconds = 0.0
-    let reducedMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    let reducedMotion = !controller.previewAnimationsEnabled
     var stage = "setup"
     func check(_ value: Bool, _ label: String) {
         checks += 1

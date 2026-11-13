@@ -107,11 +107,13 @@ GitHub 默认提供上传所需的 `GITHUB_TOKEN`，无需另配个人访问令�
 
 逻辑检查使用临时数据和测试剪贴板。翻译检查需要 Python 3，并在 `127.0.0.1:18767` 启动本机模拟服务，使用虚构凭据，不访问你的翻译接口。
 
-窗口与键盘检查需要前台图形桌面；先退出正常实例，再运行：
+窗口与键盘检查需要前台图形桌面。正式安装包不包含这些测试入口；先运行 `scripts/unit-tests.sh` 生成测试可执行文件，再退出正常实例并运行：
 
 ```sh
-build/GuziPaste.app/Contents/MacOS/OpenPaste --layout-test
-build/GuziPaste.app/Contents/MacOS/OpenPaste --keyboard-test
+test_arch="$(uname -m)"
+test_binary="$(OPENPASTE_TESTING=1 swift build --manifest-cache none -c release --triple "${test_arch}-apple-macosx14.0" --scratch-path "build/swiftpm-tests-${test_arch}" --show-bin-path)/OpenPaste"
+"$test_binary" --layout-test
+"$test_binary" --keyboard-test
 ```
 
 它们使用演示数据，通过 AppKit 事件分发验证本进程的窗口与按键处理，退出时恢复剪贴板，不向其他应用粘贴；未取得前台激活时会明确失败。这些检查不能代替真实全局快捷键、跨应用自动粘贴或多设备验收，后者按 [产品功能与边界验收](ACCEPTANCE.md) 实测。贡献方式见 [CONTRIBUTING.md](../CONTRIBUTING.md)，版本变化见 [GitHub Releases](https://github.com/SwallOwDili/OpenPaste/releases)。

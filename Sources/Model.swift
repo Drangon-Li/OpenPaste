@@ -203,6 +203,9 @@ final class Store: ObservableObject {
     @Published var root: URL
     @Published var initialLoading = false
     @Published var changingDataDirectory = false
+    @Published var directoryChangeID: UUID?
+    var directoryChangeInProgress: Bool { changingDataDirectory || directoryChangeID != nil }
+    var canCancelDirectoryChange: Bool { directoryChangeID != nil && !changingDataDirectory }
     @Published var directoryStatus = ""
     @Published var directoryProgress = ImportProgress(phase: "", completed: 0, total: 0)
     @Published var isICloudDirectory = false
@@ -687,10 +690,10 @@ final class Store: ObservableObject {
     func persistStorageLimitPreference() {
         if usePreferences { configurationDefaults?.set(storageLimitMB, forKey: "storageLimitMB") }
     }
-    func invalidatePendingStorageCallbacks() {
+    func invalidatePendingStorageCallbacks(keepingQueuedSave: Bool = false) {
         directoryMutation += 1
         storageCallbackGeneration += 1
-        _ = saveGeneration.next()
+        if !keepingQueuedSave { _ = saveGeneration.next() }
         savePending = false
         storageRetryInFlight = false
     }

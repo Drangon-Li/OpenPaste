@@ -107,7 +107,7 @@ struct TranslationSettings: View {
                         .font(.caption).foregroundStyle(store.translationSelectionAuthorized ? Color.green : Color.orange)
                     Spacer()
                     if !store.translationSelectionAuthorized {
-                        Button("打开辅助功能设置…") { Controller.shared.requestAccessibility() }
+                        Button("授权指引…") { Controller.shared.requestAccessibility(for: .selection) }
                     }
                 }
                 if !store.translationSelectionAuthorized {

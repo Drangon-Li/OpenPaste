@@ -110,7 +110,7 @@ func runStorageRecoveryTests() {
         recoverySwitch.archive = Archive(clips: [damagedMemoryClip])
         recoverySwitch.setUserPaused(true)
         recoverySwitch.changeDataDirectory(to: badTarget)
-        check(wait { !recoverySwitch.changingDataDirectory }, "bad recovery target finishes with an explicit failure")
+        check(wait { !recoverySwitch.directoryChangeInProgress }, "bad recovery target finishes with an explicit failure")
         check(recoverySwitch.root.standardizedFileURL == unreadableSource.standardizedFileURL && !recoverySwitch.canModifyHistory && recoverySwitch.archive.clips.map(\.id) == [damagedMemoryClip.id] && recoverySwitch.directoryStatus.hasPrefix("切换失败"),
               "bad recovery target preserves the protected source and reports the failure")
         let unreadableHashAfterFailure = HistoryStorage.digest(try Data(contentsOf: unreadableManifest))
@@ -129,7 +129,7 @@ func runStorageRecoveryTests() {
         try DataDirectory.cache(DataDirectory.baseline(Archive(clips: [cacheClip])), root: goodTarget)
         let recoveryCacheHash = HistoryStorage.digest(try Data(contentsOf: recoveryCache))
         recoverySwitch.changeDataDirectory(to: goodTarget)
-        check(wait { !recoverySwitch.changingDataDirectory }, "good recovery target completes")
+        check(wait { !recoverySwitch.directoryChangeInProgress }, "good recovery target completes")
         check(recoverySwitch.root.standardizedFileURL == goodTarget.standardizedFileURL && recoverySwitch.canModifyHistory && Set(recoverySwitch.archive.clips.map(\.id)) == Set([targetClip.id, cacheClip.id]) && !recoverySwitch.archive.clips.contains(where: { $0.id == damagedMemoryClip.id }),
               "load failure switches by reading the target and cache without merging the damaged source archive")
         check(recoverySwitch.recordingPauseControl.action == .resume && recoverySwitch.userPaused,
@@ -148,7 +148,7 @@ func runStorageRecoveryTests() {
         let emptyTarget = sandbox.appendingPathComponent("new-empty-target")
         let emptyRecovery = Store(root: secondUnreadableSource)
         emptyRecovery.changeDataDirectory(to: emptyTarget)
-        check(wait { !emptyRecovery.changingDataDirectory }, "new empty recovery target completes")
+        check(wait { !emptyRecovery.directoryChangeInProgress }, "new empty recovery target completes")
         check(emptyRecovery.root.standardizedFileURL == emptyTarget.standardizedFileURL && emptyRecovery.canModifyHistory && emptyRecovery.archive.clips.isEmpty,
               "an independent nonexistent directory is accepted as an empty recovery target")
         let secondUnreadableHashAfter = HistoryStorage.digest(try Data(contentsOf: secondUnreadableManifest))
@@ -423,7 +423,7 @@ func runStorageRecoveryTests() {
         let readableRecoveryClip = clip("history from selected readable directory")
         try HistoryStorage.write(Archive(clips: [readableRecoveryClip]), to: readableRecoveryRoot.appendingPathComponent("history.json"))
         switchRecoveryStore.changeDataDirectory(to: readableRecoveryRoot)
-        check(wait(8) { !switchRecoveryStore.changingDataDirectory },
+        check(wait(8) { !switchRecoveryStore.directoryChangeInProgress },
               "switching away from an unreadable initial directory completes")
         check(switchRecoveryStore.root.standardizedFileURL == readableRecoveryRoot.standardizedFileURL &&
               switchRecoveryStore.archive.clips.map(\.id) == [readableRecoveryClip.id] &&
@@ -557,12 +557,195 @@ func runStorageRecoveryTests() {
         _ = switching.ingest(switchedClip)
         switching.persistenceQueue.sync {}
         switching.changeDataDirectory(to: switchedRoot)
-        check(wait(8) { !switching.changingDataDirectory }, "directory switch completes after an older write callback was queued")
+        check(wait(8) { !switching.directoryChangeInProgress }, "directory switch completes after an older write callback was queued")
         drain(switching)
         check(switching.root.standardizedFileURL == switchedRoot.standardizedFileURL && !switching.recordingSafetyPaused,
               "callback from the old directory cannot lock the new directory generation")
         check(try HistoryStorage.read(from: switchedRoot.appendingPathComponent("history.json")).clips.contains { $0.id == switchedClip.id },
               "directory switch preserves the in-memory archive")
+
+        let waitingSource = sandbox.appendingPathComponent("download-wait-source")
+        let waitingTarget = sandbox.appendingPathComponent("download-wait-target")
+        let remoteClip = clip("remote history downloading")
+        let lateClip = clip("new manifest arrived after the preflight")
+        let waitingCacheClip = clip("previous target cache")
+        let waitingSourceManifest = waitingSource.appendingPathComponent("history.json")
+        let remoteManifest = waitingTarget.appendingPathComponent("device-remote.json")
+        let waitingTargetCache = DataDirectory.cacheURL(waitingTarget).deletingLastPathComponent()
+        defer { try? fm.removeItem(at: waitingTargetCache) }
+        let initialClip = clip("original local history")
+        try HistoryStorage.write(Archive(clips: [initialClip]), to: waitingSourceManifest)
+        try DataDirectory.write(DataDirectory.baseline(Archive(clips: [remoteClip])), root: waitingTarget, device: "remote")
+        try DataDirectory.cache(DataDirectory.baseline(Archive(clips: [waitingCacheClip])), root: waitingTarget)
+        let remoteHash = HistoryStorage.digest(try Data(contentsOf: remoteManifest))
+        let remoteBlob = waitingTarget.appendingPathComponent("blobs").appendingPathComponent(HistoryStorage.digest(remoteClip.parts[0][0].data))
+        let remoteBlobStub = remoteBlob.deletingLastPathComponent().appendingPathComponent(".\(remoteBlob.lastPathComponent).icloud")
+        let lateBlob = waitingTarget.appendingPathComponent("blobs").appendingPathComponent(HistoryStorage.digest(lateClip.parts[0][0].data))
+        try fm.moveItem(at: remoteBlob, to: remoteBlobStub)
+
+        let waitingSuite = "OpenPaste.directory-wait.\(UUID().uuidString)"
+        guard let waitingDefaults = UserDefaults(suiteName: waitingSuite) else { throw PasteImport.failure("无法创建隔离设置域") }
+        defer { waitingDefaults.removePersistentDomain(forName: waitingSuite) }
+        waitingDefaults.set(waitingSource.path, forKey: "dataDirectory")
+        waitingDefaults.set(true, forKey: "recordingAccepted")
+        let waiting = Store(defaults: waitingDefaults, deviceID: "waiting-test")
+        let clipboard = NSPasteboard.withUniqueName()
+        defer { clipboard.releaseGlobally() }
+        waiting.pauseBoundaryPasteboard = { clipboard }
+        func captureWhileWaiting(_ title: String) throws -> UUID {
+            clipboard.clearContents()
+            clipboard.setString(title, forType: .string)
+            waiting.capture(pasteboard: clipboard, sourceOverride: ClipboardCaptureSource(name: "Recovery fixture", bundleID: "test.recovery"))
+            guard let id = waiting.archive.clips.first(where: { $0.text == title })?.id else {
+                throw PasteImport.failure("capture during download wait did not record")
+            }
+            return id
+        }
+
+        let secondProbeStarted = DispatchSemaphore(value: 0)
+        let releaseSecondProbe = DispatchSemaphore(value: 0)
+        let secondProbeCompleted = DispatchSemaphore(value: 0)
+        let retryTimes = DirectoryProbeTimes()
+        waiting.changeDataDirectory(to: waitingTarget, readiness: { url in
+            try DataDirectory.ready(url) { _ in
+                if retryTimes.record() == 2 {
+                    secondProbeStarted.signal()
+                    releaseSecondProbe.wait()
+                    defer { secondProbeCompleted.signal() }
+                    throw PasteImport.failure("late probe from the canceled directory")
+                }
+            }
+        })
+        check(wait { waiting.directoryStatus.hasPrefix("iCloud 内容正在下载") && waiting.canCancelDirectoryChange },
+              "a placeholder starts a cancelable wait even when a complete local target cache exists")
+        let originalWaitStatus = waiting.directoryStatus
+        check(!waiting.paused && waiting.canModifyHistory && waiting.root.path == waitingSource.path &&
+              waitingDefaults.string(forKey: "dataDirectory") == waitingSource.path,
+              "waiting keeps recording, the active source, and the selected-directory preference")
+        let firstDuringWait = try captureWhileWaiting("captured during the first download wait")
+        waiting.flush()
+        check(wait { !waiting.savePending }, "source save finishes during the download wait")
+        waiting.pollDirectory(force: true)
+        waiting.flush()
+        check(wait { !waiting.syncChecking }, "source sync poll finishes during the download wait")
+        check(waiting.directoryStatus == originalWaitStatus,
+              "source save and poll completions leave the destination's waiting status intact")
+        var sawSecondProbe = false
+        check(wait(4) {
+            if !sawSecondProbe { sawSecondProbe = secondProbeStarted.wait(timeout: .now()) == .success }
+            return sawSecondProbe
+        },
+              "the download probe automatically retries while the settings view is closed")
+        let times = retryTimes.values
+        check(times.count == 2 && times[1] - times[0] >= 0.8, "the next download probe is delayed by backoff")
+        let secondDuringWait = try captureWhileWaiting("captured while the second probe was blocked")
+        // Release even if flush regresses and starts waiting on the target probe.
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2) { releaseSecondProbe.signal() }
+        let flushStart = ProcessInfo.processInfo.systemUptime
+        waiting.flush()
+        let flushTime = ProcessInfo.processInfo.systemUptime - flushStart
+        let savedDuringWait = try Set(HistoryStorage.read(from: waitingSourceManifest).clips.map(\.id))
+        print(String(format: "Download wait fixture: retry interval %.0f ms, source flush while target was blocked %.1f ms, source manifest has %d records", (times[1] - times[0]) * 1000, flushTime * 1000, savedDuringWait.count))
+        check(flushTime < 0.5 && savedDuringWait == Set([initialClip.id, firstDuringWait, secondDuringWait]),
+              "source history saves and exit flush stays responsive during a blocked destination probe")
+        let canceledTargetFiles = try fm.subpathsOfDirectory(atPath: waitingTarget.path).sorted()
+        waiting.cancelDataDirectoryChange()
+        check(!waiting.directoryChangeInProgress && !waiting.paused && waitingDefaults.string(forKey: "dataDirectory") == waitingSource.path,
+              "cancel keeps the source preference and leaves recording available")
+        let canceledStatus = waiting.directoryStatus
+        releaseSecondProbe.signal()
+        check(secondProbeCompleted.wait(timeout: .now() + 1) == .success, "canceled probe returns its late error")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        let remoteHashAfterCancel = HistoryStorage.digest(try Data(contentsOf: remoteManifest))
+        let filesAfterCancel = try fm.subpathsOfDirectory(atPath: waitingTarget.path).sorted()
+        check(waiting.directoryStatus == canceledStatus && waiting.root.path == waitingSource.path &&
+              remoteHashAfterCancel == remoteHash && filesAfterCancel == canceledTargetFiles,
+              "late errors after cancel change neither the current status nor the destination files")
+
+        let readyProbeStarted = DispatchSemaphore(value: 0)
+        let releaseReadyProbe = DispatchSemaphore(value: 0)
+        let readyProbeCompleted = DispatchSemaphore(value: 0)
+        let pendingSuccessTarget = sandbox.appendingPathComponent("late-ready-target")
+        let pendingSuccessBlobs = pendingSuccessTarget.appendingPathComponent("blobs").path
+        let readyProbeCalls = DirectoryProbeTimes()
+        try HistoryStorage.write(Archive(clips: [clip("late readable remote result")]), to: pendingSuccessTarget.appendingPathComponent("history.json"))
+        waiting.changeDataDirectory(to: pendingSuccessTarget, readiness: { url in
+            if url.path == pendingSuccessBlobs, readyProbeCalls.record() == 2 {
+                readyProbeStarted.signal()
+                releaseReadyProbe.wait()
+                defer { readyProbeCompleted.signal() }
+                return try DataDirectory.ready(url)
+            }
+            try DataDirectory.ready(url)
+        })
+        check(readyProbeStarted.wait(timeout: .now() + 1) == .success, "cancel fixture blocks a ready target check")
+        waiting.cancelDataDirectoryChange()
+
+        let migrationReadStarted = DispatchSemaphore(value: 0)
+        let allowMigrationRead = DispatchSemaphore(value: 0)
+        let lateManifest = waitingTarget.appendingPathComponent("device-late.json")
+        let lateManifestStub = waitingTarget.appendingPathComponent(".device-late.json.icloud")
+        let finalReads = DirectoryProbeTimes()
+        waiting.changeDataDirectory(to: waitingTarget, readiness: { url in
+            try DataDirectory.ready(url, requestDownload: { _ in })
+        }, willReadForMigration: {
+            if finalReads.record() == 1 {
+                migrationReadStarted.signal()
+                allowMigrationRead.wait()
+                try Data().write(to: lateManifestStub)
+            }
+        })
+        releaseReadyProbe.signal()
+        check(readyProbeCompleted.wait(timeout: .now() + 1) == .success, "canceled probe returns a late ready result")
+        check(wait { waiting.directoryStatus.hasPrefix("iCloud 内容正在下载") && waiting.canCancelDirectoryChange },
+              "a canceled ready callback cannot install a root or override a newer wait")
+        check(waiting.root.path == waitingSource.path && waitingDefaults.string(forKey: "dataDirectory") == waitingSource.path,
+              "the newer target still waits with the original source selected")
+
+        // Import may start while the destination is waiting. Its completion must be installed before migration.
+        waiting.importingPaste = true
+        try fm.moveItem(at: remoteBlobStub, to: remoteBlob)
+        let readyWhileImporting = Date().addingTimeInterval(1.4)
+        RunLoop.main.run(until: readyWhileImporting)
+        check(waiting.canCancelDirectoryChange && !waiting.changingDataDirectory && waiting.root.path == waitingSource.path,
+              "target readiness cannot freeze or switch directories during a concurrent import")
+        waiting.importingPaste = false
+        let beforeFinalRead = try captureWhileWaiting("captured before the final reread")
+        var sawMigrationRead = false
+        check(wait(4) {
+            if !sawMigrationRead { sawMigrationRead = migrationReadStarted.wait(timeout: .now()) == .success }
+            return sawMigrationRead
+        }, "ready target starts the final migration read")
+        check(waiting.changingDataDirectory && !waiting.canCancelDirectoryChange, "the commit phase cannot be canceled")
+        waiting.cancelDataDirectoryChange()
+        check(waiting.changingDataDirectory, "cancel action is ignored during the commit phase")
+        allowMigrationRead.signal()
+        check(wait(4) { waiting.directoryStatus.hasPrefix("iCloud 内容正在下载") && waiting.canCancelDirectoryChange && !waiting.paused },
+              "an additional placeholder in the final read returns to waiting and resumes recording")
+        check(waitingDefaults.string(forKey: "dataDirectory") == waitingSource.path &&
+              !fm.fileExists(atPath: waitingTarget.appendingPathComponent("device-waiting-test.json").path),
+              "the final reread does not publish incomplete target history")
+        let afterFinalRead = try captureWhileWaiting("captured after the final reread returned to waiting")
+        waiting.flush()
+        let expectedSource = Set([initialClip.id, firstDuringWait, secondDuringWait, beforeFinalRead, afterFinalRead])
+        check(try Set(HistoryStorage.read(from: waitingSourceManifest).clips.map(\.id)) == expectedSource,
+              "source history continues saving after final reread returns to waiting")
+        let recordedLateSource = try captureWhileWaiting("captured just before the target completed")
+        try DataDirectory.write(DataDirectory.baseline(Archive(clips: [lateClip])), root: waitingTarget, device: "late")
+        try fm.removeItem(at: lateManifestStub)
+        check(wait(8) { !waiting.directoryChangeInProgress && waiting.root.path == waitingTarget.path },
+              "complete target history triggers the final switch automatically")
+        waiting.flush()
+        let finalExpectedSource = expectedSource.union([recordedLateSource])
+        let expectedTarget = finalExpectedSource.union([remoteClip.id, waitingCacheClip.id, lateClip.id])
+        let switched = try DataDirectory.load(waitingTarget)
+        check(waitingDefaults.string(forKey: "dataDirectory") == waitingTarget.path && Set(switched.archive.clips.map(\.id)) == expectedTarget &&
+              Set(waiting.archive.clips.map(\.id)) == expectedTarget,
+              "migration keeps all waiting-period records, remote history, and the valid target cache")
+        let finalSourceIDs = try Set(HistoryStorage.read(from: waitingSourceManifest).clips.map(\.id))
+        let finalRemoteHash = HistoryStorage.digest(try Data(contentsOf: remoteManifest))
+        check(finalSourceIDs == finalExpectedSource && finalRemoteHash == remoteHash && fm.fileExists(atPath: lateManifest.path) && fm.fileExists(atPath: lateBlob.path),
+              "the complete switch retains the original source and independent remote device manifests")
 
         // A transient write failure (for example a momentarily full disk) must not keep recording
         // paused until the user presses 重试保存: nothing else retries, so capture stays off for good.
@@ -582,4 +765,22 @@ func runStorageRecoveryTests() {
 
         print("Storage recovery: \(checks) checks passed")
     } catch { print("FAIL: \(error)"); exit(1) }
+}
+
+private final class DirectoryProbeTimes {
+    private let lock = NSLock()
+    private var times: [TimeInterval] = []
+
+    var values: [TimeInterval] {
+        lock.lock()
+        defer { lock.unlock() }
+        return times
+    }
+
+    func record() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        times.append(ProcessInfo.processInfo.systemUptime)
+        return times.count
+    }
 }
