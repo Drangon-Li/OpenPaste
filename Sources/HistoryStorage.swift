@@ -60,8 +60,9 @@ enum HistoryStorage {
         guard info.st_mode & S_IFMT == S_IFREG else { return .invalid }
         return .regular(size: Int(info.st_size))
     }
-    static func read(from url: URL, contentRoot: URL? = nil) throws -> Archive {
-        try DataDirectory.ready(url)
+    static func read(from url: URL, contentRoot: URL? = nil, readiness: DataDirectory.ReadinessCheck = DataDirectory.ready,
+                     checkCloudAttachments: Bool? = nil) throws -> Archive {
+        try readiness(url)
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
         // Older releases stored all clipboard bytes inline; keep that migration path.
         let header = try JSONSerialization.jsonObject(with: data) as? [String: Any]
@@ -69,28 +70,41 @@ enum HistoryStorage {
         let disk = try JSONDecoder().decode(DiskArchive.self, from: data)
         guard disk.version == 2 else { throw PasteImport.failure("历史数据版本不受支持") }
         let folder = (contentRoot ?? url.deletingLastPathComponent()).appendingPathComponent("blobs", isDirectory: true)
+        try readiness(folder)
         // Per-attachment filesystem probes dominated cold start (~1.1 s for 7,500 files):
         // resolve the folder and iCloud state once, and avoid URL calls that stat the disk.
         let resolvedFolder = folder.resolvingSymlinksInPath()
         let folderPath = folder.path
-        let checkPlaceholders = DataDirectory.isCloud(folder)
-        let fileManager = FileManager.default
+        let checkPlaceholders = checkCloudAttachments ?? DataDirectory.isCloud(folder)
+        var pending = false
         let clips = try disk.clips.map { item -> Clip in
             var clip = item.clip
-            clip.parts = try item.parts.map { try $0.map { part in
+            clip.parts = try item.parts.map { try $0.compactMap { part in
                 guard validID(part.blob) else { throw PasteImport.failure("历史内容路径无效") }
                 let path = URL(fileURLWithPath: folderPath + "/" + part.blob, isDirectory: false)
-                if checkPlaceholders { try DataDirectory.ready(path) }
-                guard case .regular(let size) = blobState(path, resolvedFolder: resolvedFolder), size == part.size,
-                      let content = try? Data(contentsOf: path, options: .mappedIfSafe), content.count == part.size else {
-                    // Missing placeholders must still report the iCloud download state, as before.
-                    if !checkPlaceholders { try DataDirectory.ready(path) }
-                    throw PasteImport.failure("历史内容文件缺失或损坏")
+                do {
+                    if checkPlaceholders { try readiness(path) }
+                    guard case .regular(let size) = blobState(path, resolvedFolder: resolvedFolder), size == part.size else {
+                        try readiness(path)
+                        throw PasteImport.failure("历史内容文件缺失或损坏")
+                    }
+                    let content: Data
+                    do { content = try Data(contentsOf: path, options: .mappedIfSafe) }
+                    catch {
+                        try readiness(path)
+                        throw error
+                    }
+                    guard content.count == part.size else { throw PasteImport.failure("历史内容文件缺失或损坏") }
+                    return ClipPart(type: part.type, data: content, storageID: part.blob)
+                } catch is ICloudDownloadPending {
+                    // Discover the other attachments before retrying the whole archive.
+                    pending = true
+                    return nil
                 }
-                return ClipPart(type: part.type, data: content, storageID: part.blob)
             } }
             return clip
         }
+        if pending { throw ICloudDownloadPending() }
         return Archive(clips: clips, boards: disk.boards)
     }
     static func syncIndex(from url: URL) throws -> SyncIndex? {

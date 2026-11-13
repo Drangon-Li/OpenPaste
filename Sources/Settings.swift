@@ -120,7 +120,17 @@ struct SettingsPageView: View {
     @ObservedObject private var installer = UpdateInstaller.shared
     @ObservedObject private var analytics = UsageAnalytics.shared
     @ObservedObject private var login = LaunchAtLogin.shared
+    @AppStorage("showMenuBarIcon", store: AppEnvironment.current.defaults) private var showMenuBarIcon = true
+    @AppStorage("interfaceAppearance", store: AppEnvironment.current.defaults) private var interfaceAppearance = "system"
+    @AppStorage("previewAnimationsEnabled", store: AppEnvironment.current.defaults) private var previewAnimationsEnabled = true
     @State private var translationKey = ""
+    private func toggleRow(_ title: String, isOn: Binding<Bool>) -> some View {
+        HStack {
+            Text(title)
+            Spacer(minLength: 16)
+            Toggle(title, isOn: isOn).labelsHidden().toggleStyle(.switch)
+        }
+    }
     private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title).font(.system(size: 12, weight: .semibold)).foregroundStyle(.secondary)
@@ -160,9 +170,9 @@ struct SettingsPageView: View {
                 Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "OpenPasteReleaseVersion") as? String ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")").font(.system(size: 11)).foregroundStyle(.tertiary)
             }.padding(.vertical, 24).frame(maxWidth: .infinity).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             group("软件更新") {
-                Toggle("自动检查更新", isOn: $updates.automatic).toggleStyle(.switch)
+                toggleRow("自动检查更新", isOn: $updates.automatic)
                 note("开启后每次启动检查 GuziPaste 新版本，持续运行时每天检查一次。发现新版后可选择更新或跳过。")
-                Toggle("包含预发布版本", isOn: $updates.includePrerelease).toggleStyle(.switch)
+                toggleRow("包含预发布版本", isOn: $updates.includePrerelease)
                 note("默认只发现正式版。开启后也会发现 rc 等预发布版本，它们可能不稳定。")
                 HStack {
                     Text(updates.message).font(.system(size: 12)).foregroundStyle(updates.available == nil ? Color.secondary : Color.accentColor)
@@ -241,9 +251,9 @@ struct SettingsPageView: View {
     private var general: some View {
         VStack(alignment: .leading, spacing: 22) {
             group("启动") {
-                Toggle("登录 Mac 时启动 GuziPaste", isOn: Binding(get: { login.enabled }, set: { login.setEnabled($0) }))
-                    .toggleStyle(.switch).disabled(login.changing || !login.available)
-                note("登录后在菜单栏运行。开启自动检查更新后，启动时会检查新版本。")
+                toggleRow("登录 Mac 时启动 GuziPaste", isOn: Binding(get: { login.enabled }, set: { login.setEnabled($0) }))
+                    .disabled(login.changing || !login.available)
+                note("登录后在后台运行。开启自动检查更新后，启动时会检查新版本。")
                 if login.status == .requiresApproval {
                     note("请在系统的登录项设置中允许 GuziPaste 启动。")
                     Button("打开登录项设置…") { login.openSystemSettings() }
@@ -253,6 +263,28 @@ struct SettingsPageView: View {
             }
             .onAppear { login.refresh() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in login.refresh() }
+            group("外观") {
+                toggleRow("显示菜单栏图标", isOn: $showMenuBarIcon)
+                note("隐藏后可按 \(store.shortcutLabel) 呼出，再从面板的更多菜单进入设置。")
+                if !showMenuBarIcon, Controller.shared.hotkey == nil, !store.recordingShortcut {
+                    note("当前呼出快捷键未生效，菜单栏入口暂时保留。可在下方更改快捷键。")
+                }
+                Divider()
+                HStack {
+                    Text("外观模式")
+                    Spacer()
+                    Picker("外观模式", selection: $interfaceAppearance) {
+                        Text("跟随系统").tag("system")
+                        Text("浅色").tag("light")
+                        Text("深色").tag("dark")
+                    }.labelsHidden().frame(width: 160)
+                }
+                Divider()
+                toggleRow("预览动画", isOn: $previewAnimationsEnabled)
+                note("关闭后，空格直接展开或收起预览。系统开启减少动态效果时也会直接切换。")
+            }
+            .onChange(of: showMenuBarIcon) { _, _ in Controller.shared.applyMenuBarVisibility() }
+            .onChange(of: interfaceAppearance) { _, _ in Controller.shared.applyInterfaceAppearance() }
             group("键盘操作") {
                 HStack { Text("呼出剪贴板"); Spacer(); Text(store.recordingShortcut ? "请按组合键…" : store.shortcutLabel).font(.system(size: 12, weight: .medium, design: .monospaced)).padding(.horizontal, 10).padding(.vertical, 6).background(.quaternary, in: RoundedRectangle(cornerRadius: 6)); Button(store.recordingShortcut ? "取消" : "更改…") { Controller.shared.beginShortcutRecording() } }
                 HStack { note(store.shortcutNotice.isEmpty ? "使用 ⌘、⌃ 或 ⌥ 搭配一个按键，也可组合 ⇧。录制时按 Esc 取消。" : store.shortcutNotice); Spacer(); Button("恢复默认") { Controller.shared.cancelShortcutRecording(); Controller.shared.installShortcut(.standard, persist: true) }.buttonStyle(.link).font(.caption) }
@@ -293,7 +325,7 @@ struct SettingsPageView: View {
                 }
                 note("默认高度 360 点，也可拖动面板顶部调整。")
                 Divider()
-                HStack { Text("加载网页与地图预览"); Spacer(); Toggle("加载网页与地图预览", isOn: $store.networkPreviews).labelsHidden().toggleStyle(.switch) }
+                toggleRow("加载网页与地图预览", isOn: $store.networkPreviews)
                 note("访问对应网页与 Apple 地图以获取预览。内网地址及疑似验证链接需在卡片上点击加载；关闭后不再发起新的预览请求。")
                 Divider()
                 HStack { VStack(alignment: .leading, spacing: 4) { Text("图片文字识别"); note(store.ocrProgress.isEmpty ? "识别后的文字可在历史中搜索" : store.ocrProgress) }; Spacer(); Button(store.indexingImages ? "识别中…" : "识别历史图片") { store.indexImages() }.disabled(store.indexingImages) }
@@ -304,10 +336,10 @@ struct SettingsPageView: View {
         VStack(alignment: .leading, spacing: 22) {
             group("辅助功能") {
                 HStack { Label("直接粘贴", systemImage: "keyboard"); Spacer(); Label(store.permissionStatus, systemImage: store.directPasteAuthorized ? "checkmark.circle.fill" : "exclamationmark.circle").font(.caption).foregroundStyle(store.directPasteAuthorized ? Color.green : Color.orange) }
-                HStack { Text("按回车直接粘贴"); Spacer(); Toggle("按回车直接粘贴", isOn: $store.pasteOnReturn).labelsHidden().toggleStyle(.switch) }
+                toggleRow("按回车直接粘贴", isOn: $store.pasteOnReturn)
                 note("开启且系统已授权时，按回车会粘贴到原输入框。关闭或未授权时，按回车只复制，可手动按 ⌘V 粘贴。")
-                Button("打开辅助功能设置…") { Controller.shared.requestAccessibility() }
-                if !store.directPasteAuthorized { note("如果系统辅助功能授权已开启，退出并重新打开 GuziPaste。若仍未生效，请移除旧条目，重新添加当前运行的 GuziPaste.app。") }
+                Button("授权指引…") { Controller.shared.requestAccessibility() }
+                if !store.directPasteAuthorized { note("找不到 GuziPaste 时，打开授权指引，将应用图标拖入辅助功能列表。") }
             }
             group("排除应用") {
                 note("这些应用的复制内容不会记录，也不会执行快速翻译。每行填写一个 Bundle ID。")
@@ -316,7 +348,7 @@ struct SettingsPageView: View {
             }
             group("记录控制") { HStack { Text(store.recordingPauseControl.status); Spacer(); Button(store.recordingPauseControl.buttonTitle) { Controller.shared.togglePause() }.disabled(store.recordingPauseControl.action == .unavailable) }; note("普通文字中的密码无法可靠识别，请使用排除应用或暂停记录。历史由 macOS 账户权限和磁盘保护，未单独加密。") }
             group("匿名使用统计") {
-                HStack { Text("帮助改进 GuziPaste"); Spacer(); Toggle("帮助改进 GuziPaste", isOn: $analytics.enabled).labelsHidden().toggleStyle(.switch).disabled(!analytics.available) }
+                toggleRow("帮助改进 GuziPaste", isOn: $analytics.enabled).disabled(!analytics.available)
                 if analytics.available {
                     note("默认开启。GuziPaste 向 Google Firebase Analytics 记录首次启动、粘贴取用和翻译成功三项次数；首次启动用于估算安装量。SDK 还会处理应用实例标识、设备与应用版本等基础信息。不会发送剪贴板内容、所选文字、网址、文件路径或翻译 API Key。关闭后停止收集并清除本机统计标识。")
                 } else {
@@ -332,18 +364,23 @@ struct SettingsPageView: View {
                 note("在各台 Mac 上选择 iCloud Drive 中的同一专用文件夹，可合并历史、收藏和图片。上传与下载由 macOS 完成。")
                 HStack {
                     Button(store.isICloudDirectory ? "选择其他 iCloud 文件夹…" : "启用 iCloud Drive 同步…") { store.chooseICloudDirectory() }
+                        .disabled(store.directoryChangeInProgress)
                     if store.isICloudDirectory {
                         Button(store.directorySyncInProgress ? "正在检查…" : "检查 / 重试同步") { store.retryDirectorySync() }
                             .disabled(store.directorySyncInProgress)
                     }
                 }
                 if !store.directorySyncStatus.isEmpty { note(store.directorySyncStatus) }
-                if store.isICloudDirectory { Button("改回本机保存") { store.changeDataDirectory(to: DataDirectory.defaultRoot) } }
+                if store.isICloudDirectory {
+                    Button("改回本机保存") { store.changeDataDirectory(to: DataDirectory.defaultRoot) }
+                        .disabled(store.directoryChangeInProgress)
+                }
             }
             group("数据保存目录") {
                 HStack { Label(directory.isCloud ? "iCloud Drive" : (store.root.standardizedFileURL.path == DataDirectory.defaultRoot.standardizedFileURL.path ? "本机默认目录" : "自定义目录"), systemImage: directory.isCloud ? "icloud" : "folder"); Spacer(); Button("打开目录") { Controller.shared.openExternal(store.root) } }
                 Text(store.root.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).foregroundStyle(.secondary)
                 HStack { Button("更改目录…") { store.chooseDataDirectory() }.buttonStyle(.borderedProminent); if store.root.standardizedFileURL.path != DataDirectory.defaultRoot.standardizedFileURL.path { Button("恢复默认目录") { store.changeDataDirectory(to: DataDirectory.defaultRoot) } } }
+                    .disabled(store.directoryChangeInProgress)
                 if !store.hasHistoryLoadFailure {
                     note("历史、收藏和图片附件一起迁移，目标已有历史会合并，原目录保留为备份。选择 iCloud Drive 中的专用文件夹后，由系统同步数据；其他 Mac 选择同一文件夹即可读取历史。")
                 } else {
@@ -351,6 +388,7 @@ struct SettingsPageView: View {
                 }
                 note("离线缓存、翻译 API Key、快捷键和权限配置留在本机。文件条目只保存引用，另一台 Mac 不一定能访问原文件。")
                 if !store.directoryStatus.isEmpty { Text(store.directoryStatus).font(.caption).foregroundStyle(store.directoryStatus.hasPrefix("切换失败") ? Color.orange : Color.secondary).fixedSize(horizontal: false, vertical: true) }
+                if store.canCancelDirectoryChange { Button("取消切换") { store.cancelDataDirectoryChange() } }
                 if store.changingDataDirectory { Text(store.directoryProgress.phase).font(.caption); ProgressView(value: store.directoryProgress.fraction); Text("\(store.directoryProgress.completed) / \(store.directoryProgress.total)").font(.caption).monospacedDigit() }
             }
             group("从 Paste 迁移") {

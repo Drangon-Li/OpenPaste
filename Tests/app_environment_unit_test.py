@@ -196,7 +196,8 @@ print(String(data: data, encoding: .utf8)!)
 
     def test_production_and_icloud_roots_are_rejected(self):
         profile, _ = self.profile()
-        home = Path.home()
+        # Foundation honors this override; Python's Path.home() does not.
+        home = Path(os.environ.get('CFFIXED_USER_HOME') or Path.home())
         production = home / 'Library/Application Support/OpenPaste'
         production_root = production / 'build/acceptance' / str(profile)
         production_result = self.run_probe(

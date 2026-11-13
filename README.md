@@ -58,13 +58,13 @@ GuziPaste 将复制过的文字、链接、图片和文件引用放进贴近屏�
 
 ## 安装
 
-需要 **macOS 14 或更新版本**。下载 `GuziPaste-0.2.0-macos-universal.zip`，解压后将 `GuziPaste.app` 放入「应用程序」。通用包包含 Apple Silicon 和 Intel 架构，当前已在 Apple Silicon 实机验证。 [下载 v0.2.0](https://github.com/Drangon-Li/OpenPaste/releases/tag/v0.2.0)
+需要 **macOS 14 或更新版本**。下载 `GuziPaste-0.2.1-macos-universal.zip`，解压后将 `GuziPaste.app` 放入「应用程序」。通用包包含 Apple Silicon 和 Intel 架构。 [下载 v0.2.1](https://github.com/Drangon-Li/OpenPaste/releases/tag/v0.2.1)
 
 从 v0.1.0 或上游 OpenPaste 换装时，先退出旧版并备份当前数据目录，保留旧应用副本以便回退，再将应用程序目录中的旧版移出、放入 GuziPaste。两者使用相同的应用标识和默认数据目录，GuziPaste 会继续读取现有历史、收藏及设置。
 
 安装包使用固定自签名证书，尚未经过 Apple Developer ID 签名和公证。首次打开若被 macOS 阻止，确认来源和校验值后，可在「系统设置 → 隐私与安全性」选择「仍要打开」。从临时签名版首次换装后，直接粘贴可能需要在「辅助功能」中重新授权 GuziPaste。 [Apple 打开说明](https://support.apple.com/zh-cn/102445)
 
-ZIP 同页提供 SHA-256 文件。下载两个文件到同一目录后，可运行 `shasum -a 256 -c GuziPaste-0.2.0-macos-universal.sha256` 核对。
+ZIP 同页提供 SHA-256 文件。下载两个文件到同一目录后，可运行 `shasum -a 256 -c GuziPaste-0.2.1-macos-universal.sha256` 核对。
 
 如需从源码构建，安装 **Xcode Command Line Tools** 后执行以下命令，首次构建会联网下载 Swift 依赖。
 
@@ -91,6 +91,10 @@ open build/GuziPaste.app
 ## 使用
 
 首次运行时启用记录，按 **⌘⇧V** 呼出历史。快捷键可以在设置中录制，支持 **Command + 按键**，也支持 Control、Option 及组合修饰键；已有用户保留自己的配置。
+
+从 v0.2.1 起，可在「设置 → 通用 → 外观」选择是否显示菜单栏图标、切换跟随系统／浅色／深色外观，以及开启或关闭预览动画。隐藏菜单栏图标后，可用呼出快捷键进入面板，再从更多菜单打开设置。
+
+在「设置 → 隐私与权限」点击「授权指引」，可将浮窗里的 GuziPaste 图标拖到系统辅助功能列表，并开启权限。浮窗会显示当前运行的应用位置和授权状态，也可在访达中定位应用。如果 macOS 从系统临时转移路径（App Translocation）运行 GuziPaste，指引会提示先将应用放入「应用程序」，再从那里重新打开。
 
 「设置 → 隐私与权限 → 按回车直接粘贴」默认开启。系统已授权时，回车会粘贴回原输入框。关闭开关或系统尚未授权时，回车只复制，之后可手动按 ⌘V。
 
@@ -153,6 +157,8 @@ Base URL: https://your-service.example/v1
 在「设置 → 数据管理 → 更改目录」选择专用文件夹。历史、收藏和附件一起迁移，目标已有历史会合并；迁移显示进度，校验成功后切换，源目录保留。
 
 在「设置 → 数据管理 → iCloud Drive 同步」选择 **启用 iCloud Drive 同步**，选择 iCloud Drive 中的专用文件夹。另一台 Mac 使用同一 Apple 账户并选择同一文件夹，可读取和合并历史。界面显示本机缓存、等待同步及读写结果，并提供检查或重试入口。云端暂不可用时，成功写入本机缓存的新增内容可继续记录；缓存也无法保存时会暂停记录并提示处理。
+
+首次选择云端目录时，如果清单或附件尚未下载，GuziPaste 会在后台请求下载并自动重试，等待期间继续使用原目录记录。可以随时取消切换；下载完成后会合并等待期间新增的历史，校验后再切换。真正损坏或无法访问的数据仍会提示错误并保留原目录。
 
 同步速度取决于 iCloud 和网络，可能存在延迟。为保护离线设备仍可能引用的内容，共享目录中的附件不会自动回收；本地历史与本机离线缓存会回收无引用附件，撤销记录和备份仍需使用的附件会保留。请勿单独移动或删除数据目录内的文件。
 

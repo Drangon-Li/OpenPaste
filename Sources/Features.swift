@@ -222,6 +222,10 @@ extension Store {
     }
 }
 extension Controller {
+    var previewAnimationsEnabled: Bool {
+        (AppEnvironment.current.defaults.object(forKey: "previewAnimationsEnabled") as? Bool ?? true)
+            && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
     func auxiliaryWindow(_ title: String, size: NSSize) -> NSWindow {
         let window = NSWindow(contentRect: NSRect(origin: .zero, size: size), styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.title = title; window.level = NSWindow.Level(rawValue: panel.level.rawValue + 1); window.isReleasedWhenClosed = false; window.center(); window.delegate = self; return window
@@ -244,7 +248,7 @@ extension Controller {
             popover.show(relativeTo: NSRect(x: content.bounds.midX, y: content.bounds.midY, width: 1, height: 1), of: content, preferredEdge: .maxY)
         }
         guard let window = previewWindow else { finishPreviewClose(popover); return }
-        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        if previewAnimationsEnabled {
             window.alphaValue = 0.25
             fadePreview(window, to: 1)
         }
@@ -257,7 +261,7 @@ extension Controller {
     func closePreview(animated: Bool = true) {
         guard let popover = previewPopover else { return }
         let finishTiming = AcceptanceMetrics.begin("preview.close"); defer { finishTiming() }
-        if animated, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, let window = previewWindow {
+        if animated, previewAnimationsEnabled, let window = previewWindow {
             guard !previewClosing else { return }
             previewClosing = true
             fadePreview(window, to: 0)
@@ -285,7 +289,7 @@ extension Controller {
         let generation = previewFadeGeneration
         let initial = window.alphaValue
         let duration = 0.10
-        if initial == target || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+        if initial == target || !previewAnimationsEnabled {
             window.alphaValue = target
             if target == 0, let popover = previewPopover { dismissPreview(popover) }
             return

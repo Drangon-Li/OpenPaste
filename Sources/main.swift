@@ -90,6 +90,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     var pauseTimerSchedule = RecordingPauseTimerSchedule()
     lazy var recordingPausePersistence = RecordingPausePersistence(defaults: AppEnvironment.current.defaults)
     var settingsWindow: NSWindow?
+    var accessibilityGuideWindow: NSPanel?
     var settingsRequest = 0
     var activationObserver: NSObjectProtocol?
     var lastExternalApp: NSRunningApplication?
@@ -157,6 +158,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         AcceptanceMetrics.start()
         AppDiagnostics.record("app.launch")
         Controller.shared = self
+        applyInterfaceAppearance()
         let finishStoreInit = AcceptanceMetrics.begin("launch.store-init")
         _ = store
         finishStoreInit()
@@ -168,7 +170,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         finishStoreSetup()
         refreshPermission()
         let timer = Timer(timeInterval: 1, repeats: true) { [weak self] _ in
-            guard let self = self, self.panel?.isVisible == true || self.settingsWindow?.isVisible == true else { return }
+            guard let self = self, self.panel?.isVisible == true || self.settingsWindow?.isVisible == true || self.accessibilityGuideWindow?.isVisible == true else { return }
             self.refreshPermission()
         }
         permissionTimer = timer
@@ -398,15 +400,25 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             showShelf()
             Task { @MainActor in await runKeyboardTests(controller: self) }
         } else if TestMode.shortcut {
+            let defaults = AppEnvironment.current.defaults
+            let originalVisibility = defaults.object(forKey: "showMenuBarIcon")
+            defer {
+                if let originalVisibility { defaults.set(originalVisibility, forKey: "showMenuBarIcon") }
+                else { defaults.removeObject(forKey: "showMenuBarIcon") }
+            }
+            defaults.set(false, forKey: "showMenuBarIcon")
             let first = GlobalShortcut(keyCode: 111, modifiers: UInt32(cmdKey), keyName: "F12")
             guard installShortcut(first, persist: true), shortcut == first, store.shortcutLabel == first.label, hotkey != nil else { print("FAIL: custom hotkey registration"); exit(1) }
+            guard !status.isVisible else { print("FAIL: registered shortcut did not allow hiding menu icon"); exit(1) }
             var occupied: EventHotKeyRef?
             let second = GlobalShortcut(keyCode: 103, modifiers: first.modifiers, keyName: "F11")
             guard RegisterEventHotKey(second.keyCode, second.modifiers, EventHotKeyID(signature: 0x54455354, id: 2), GetApplicationEventTarget(), 0, &occupied) == noErr else { print("FAIL: prepare conflict test"); exit(1) }
             guard !installShortcut(second, persist: true), shortcut == first, hotkey != nil else { print("FAIL: conflict lost original hotkey"); exit(1) }
             beginShortcutRecording()
             guard hotkey == nil, !installShortcut(second, persist: true), store.shortcutLabel.contains("未生效"), status.menu?.items.first?.title.contains("不可用") == true else { print("FAIL: unregistered shortcut conflict was not visible"); exit(1) }
+            guard status.isVisible else { print("FAIL: unavailable shortcut left menu icon hidden"); exit(1) }
             guard installShortcut(first, persist: false, preserveNotice: true), hotkey != nil, shortcut == first else { print("FAIL: conflict during recording did not restore prior shortcut"); exit(1) }
+            guard !status.isVisible else { print("FAIL: recovered shortcut did not restore hidden preference"); exit(1) }
             store.recordingShortcut = false
             if let occupied = occupied { UnregisterEventHotKey(occupied) }
             show(); openSettings(); beginShortcutRecording()
@@ -415,7 +427,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             guard !store.recordingShortcut, hotkey != nil, shortcut == first else { print("FAIL: cancel recording did not restore hotkey"); exit(1) }
             beginShortcutRecording(); closeSettings()
             guard !store.recordingShortcut, !store.settings, hotkey != nil else { print("FAIL: close recording did not restore hotkey"); exit(1) }
-            print("PASS: global registration, conflict preserves original, cancel and close restore shortcut")
+            print("PASS: global registration, menu visibility fallback, conflict preserves original, cancel and close restore shortcut")
             NSApp.terminate(nil)
         } else if TestMode.layout {
             if CommandLine.arguments.contains("--preview-toggle-test") {
@@ -889,7 +901,19 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         store.recordingShortcut = false
         _ = installShortcut(shortcut, persist: false)
     }
+    func applyInterfaceAppearance() {
+        switch AppEnvironment.current.defaults.string(forKey: "interfaceAppearance") {
+        case "light": NSApp.appearance = NSAppearance(named: .aqua)
+        case "dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        default: NSApp.appearance = nil
+        }
+    }
+    func applyMenuBarVisibility() {
+        let requested = AppEnvironment.current.defaults.object(forKey: "showMenuBarIcon") as? Bool ?? true
+        status?.isVisible = requested || hotkey == nil || handler == nil
+    }
     @discardableResult func installShortcut(_ candidate: GlobalShortcut, persist: Bool, preserveNotice: Bool = false) -> Bool {
+        defer { applyMenuBarVisibility() }
         guard candidate.valid else { return false }
         if candidate == shortcut, hotkey != nil { store.shortcutNotice = ""; return true }
         var registered: EventHotKeyRef?
@@ -1120,13 +1144,45 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         toast?.orderOut(nil)
         NSWorkspace.shared.open(url)
     }
-    func requestAccessibility() {
+    func requestAccessibility(for purpose: AccessibilityGuide.Purpose = .directPaste) {
         closeSettings()
+        closePreview(animated: false)
         logInteraction("shelf.hide", reason: "permission-settings")
         panel.orderOut(nil)
-        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
-        _ = AXIsProcessTrustedWithOptions(options)
-        openExternal(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        let guide: NSPanel
+        if let existing = accessibilityGuideWindow {
+            guide = existing
+        } else {
+            guide = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 540),
+                                styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
+            guide.title = "GuziPaste 授权指引"
+            guide.isReleasedWhenClosed = false
+            guide.hidesOnDeactivate = false
+            guide.level = .floating
+            guide.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
+            accessibilityGuideWindow = guide
+        }
+        let appURL = Bundle.main.bundleURL.standardizedFileURL.resolvingSymlinksInPath()
+        let view = AccessibilityGuide(store: store, purpose: purpose, appURL: appURL,
+            openSettings: { [weak self] in self?.openAccessibilitySystemSettings() },
+            close: { [weak guide] in guide?.close() })
+        if let host = guide.contentView as? NSHostingView<AccessibilityGuide> {
+            host.rootView = view
+        } else {
+            let host = NSHostingView(rootView: view)
+            host.sizingOptions = []
+            guide.contentView = host
+        }
+        if let screen = panel.screen ?? NSScreen.main {
+            let frame = screen.visibleFrame
+            guide.setFrameOrigin(NSPoint(x: frame.minX + 24, y: frame.midY - guide.frame.height / 2))
+        }
+        openAccessibilitySystemSettings()
+        guide.orderFrontRegardless()
+        refreshPermission()
+    }
+    func openAccessibilitySystemSettings() {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
     func renameBoard(_ board: Board) {
         let alert = NSAlert(); alert.messageText = "重命名收藏板"
