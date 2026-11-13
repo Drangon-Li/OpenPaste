@@ -7,16 +7,28 @@
 <p align="center">macOS 原生应用 · 本机存储 · 个人及公司使用免费</p>
 
 <p align="center">
-<a href="https://www.producthunt.com/products/openpaste?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-openpaste" target="_blank" rel="noopener noreferrer"><img alt="OpenPaste - Open-source macOS clipboard manager with quick translation | Product Hunt" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1287315&amp;theme=light&amp;t=1792549923566"></a>
+<a href="https://www.producthunt.com/products/openpaste?embed=true&amp;utm_source=badge-featured&amp;utm_medium=badge&amp;utm_campaign=badge-openpaste" target="_blank" rel="noopener noreferrer"><img alt="上游 OpenPaste 的 Product Hunt 页面" width="250" height="54" src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=1287315&amp;theme=light&amp;t=1792549923566"></a>
 </p>
 
 <p align="center">
-  <a href="https://github.com/SwallOwDili/OpenPaste/releases">下载安装包</a> ·
+  <a href="#安装">源码构建</a> ·
   <a href="#使用">使用指南</a> ·
-  <a href="https://github.com/SwallOwDili/OpenPaste/issues">反馈问题</a>
+  <a href="https://github.com/SwallOwDili/OpenPaste">上游项目</a>
 </p>
 
 OpenPaste 将复制过的文字、链接、图片和文件引用放进贴近屏幕底部的横向卡片列表。通过键盘搜索、预览和取用，也可整理收藏分组、导入 Paste 历史，或连接自己的 OpenAI 兼容翻译服务。
+
+## 维护分支与上游
+
+本仓库由 Drangon-Li 独立维护，以 SwallOwDili 创建的 OpenPaste 提交 `c9a3bca` 为基线。维护分支保留原项目署名、版权与许可证。Copyright (C) 2026 SwallOwDili. [上游项目](https://github.com/SwallOwDili/OpenPaste)
+
+这一版源码已集成三个提交给上游审阅的改动。
+
+- 将更新残留目录的清理移到后台，避免目录访问拖慢启动。 [上游 PR #19](https://github.com/SwallOwDili/OpenPaste/pull/19)
+- 改善卡片点击与多选双击取用，新增回车直接粘贴开关和开发版提示。 [上游 PR #20](https://github.com/SwallOwDili/OpenPaste/pull/20)
+- 减少面板重复绘制，加入预览关闭动画，并保留动画期间的空格切换。 [上游 PR #21](https://github.com/SwallOwDili/OpenPaste/pull/21)
+
+维护分支目前提供源码构建。签名和安装验证完成后，可在本仓库的发布页提供独立安装包。
 
 ## 界面预览
 
@@ -40,54 +52,48 @@ OpenPaste 将复制过的文字、链接、图片和文件引用放进贴近屏�
 | 快速翻译 | 呼出时翻译选中文字，译文置顶，取用后替换原选区 |
 | Paste 导入 | 本机导入历史、来源、收藏和原始格式，去重、备份并显示进度 |
 | 数据目录 | 自定义保存目录、迁移历史与附件，支持选择 iCloud Drive 文件夹 |
-| 关于与更新 | 应用介绍、许可查看、GitHub 正式 Release 检测与下载入口 |
+| 关于与更新 | 应用介绍、许可查看、上游 Release 检查与下载入口 |
 | 记录控制 | 暂停记录、排除应用、历史条数和保留时间设置；清空历史时保留收藏 |
 
 ## 安装
 
-> **安装前请注意**：v0.0.4 起（预发布版自 v0.0.4-rc1 起）安装包使用固定的自签名证书签名，尚未经过 Apple Developer ID 签名和公证。首次打开可能被 macOS 拦截；请确认安装包来自本项目 Release，按系统提示允许打开。之后同一证书签名的版本互相更新，辅助功能权限会保留。从 v0.0.3 及更早的临时签名版本升级时，辅助功能权限需要重新授予一次。
+维护分支尚未发布安装包。体验上述改动需要 **macOS 14 或更新版本**及 **Xcode Command Line Tools**。首次构建会联网下载 Swift 依赖。
 
-如果系统阻止打开，请先尝试启动一次，再进入 **系统设置 → 隐私与安全性**，在对应提示中选择“仍要打开”（具体文字因 macOS 版本而异）。本项目不会要求你关闭系统安全保护。
+```sh
+xcode-select --install  # 已安装时可跳过
+git clone https://github.com/Drangon-Li/OpenPaste.git
+cd OpenPaste
+./build.sh
+open build/OpenPaste.app
+```
 
-更新后如果直接粘贴或快速翻译无法读取选区，请进入 **系统设置 → 隐私与安全性 → 辅助功能**，检查 OpenPaste 的权限。若开关已打开但仍未生效，退出 OpenPaste，移除旧条目，重新添加 `/Applications/OpenPaste.app` 并授权，然后重新启动。
+源码构建沿用上游的应用标识和默认数据目录，会读取已有的本机配置及历史。切换版本前先退出正在运行的 OpenPaste，并备份历史目录。源码构建默认使用临时签名，重新构建后如需恢复直接粘贴，可在 **系统设置 → 隐私与安全性 → 辅助功能** 中为当前应用重新授权。
 
-需要 **macOS 14 或更新版本**。
-
-1. 前往 [Releases](https://github.com/SwallOwDili/OpenPaste/releases)，下载带有 `macos-universal` 的 ZIP 安装包。
-2. 解压后，将 `OpenPaste.app` 拖入「应用程序」。
-3. 打开 OpenPaste，启用剪贴板记录；按需授予辅助功能权限。
-
-通用安装包面向 Apple Silicon 和 Intel Mac；Intel 实机兼容性仍待验证。
+上游提供自己的通用安装包，安装说明与签名情况见上游发行页。 [上游 Releases](https://github.com/SwallOwDili/OpenPaste/releases)
 
 ## 检查更新
 
-菜单栏菜单和「设置 → 关于 → 软件更新」提供 **检查更新**。默认查询最新正式版本；开启 **包含预发布版本** 后也会发现 rc 版本。新版本安装包尚未上传时会提示稍后检查。
+维护分支目前通过 GitHub 源码更新。已克隆的副本可以执行 `git pull --ff-only`，然后重新运行 `./build.sh`。
 
-**自动检查更新默认关闭**。开启后，应用启动及运行期间最多每 24 小时查询一次；网络失败不会弹窗。发现新版会在菜单和关于页面显示提示，点击后查看更新说明，选择“下载并更新”“稍后”或“跳过此版本”。跳过仅对该版本生效，手动检查可重新查看。
-
-选择“下载并更新”后，应用从本项目的 GitHub Release 下载安装包，校验 SHA-256，并要求新 App 与当前运行的 App 使用同一个 bundle id 和同一签名证书；通过后询问“重启并安装”，确认才退出并替换，随后自动重新打开，并提示“已更新到 x.y.z”；如果替换失败，会保留当前版本并提示“更新未完成”。历史数据保留，辅助功能授权因签名一致而保留。校验或替换失败时当前版本保持不变。
-
-应用内更新只在当前 App 使用固定证书签名、位于可写的应用目录且不在“App Translocation”临时路径中时可用。早期使用临时签名的版本（v0.0.3 及更早）无法验证新版来源，需要手动下载一次；之后的版本可在应用内更新。不满足条件时，弹窗仍提供“前往下载”。
-
-版本检查只向 GitHub 发送公开版本查询，下载只请求本项目 Release 资源，不上传剪贴板内容、翻译密钥或本机数据。没有使用系统通知，也不会在未经确认时下载或安装。
+菜单栏和「设置 → 关于 → 软件更新」里的检查仍查询上游 Release，自动检查默认关闭。应用内安装需要校验 SHA-256、应用标识和签名，默认临时签名的源码构建请使用上述重新构建方式获取维护分支的改动。 [维护分支源码](https://github.com/Drangon-Li/OpenPaste)
 
 ## 使用
 
 首次运行时启用记录，按 **⌘⇧V** 呼出历史。快捷键可以在设置中录制，支持 **Command + 按键**，也支持 Control、Option 及组合修饰键；已有用户保留自己的配置。
 
-在「设置 → 隐私与权限」授予辅助功能权限后，可直接粘贴回原输入框。未授权时，取用条目会复制到剪贴板，再手动按 ⌘V。
+「设置 → 隐私与权限 → 按回车直接粘贴」默认开启。系统已授权时，回车会粘贴回原输入框。关闭开关或系统尚未授权时，回车只复制，之后可手动按 ⌘V。
 
 | 快捷键 | 操作 |
 | --- | --- |
 | ← / → | 选择条目 |
-| Return | 取用并粘贴；未授权时复制 |
+| Return | 按「按回车直接粘贴」设置取用。开关关闭或未授权时只复制 |
 | ⇧Return | 纯文本取用（⇧ 可在设置中更改，快速粘贴同样适用） |
 | ⌘1–9 | 快速取用对应条目（修饰键可在设置中更改） |
 | ⌘F | 搜索 |
 | ⌘N | 新建文字 |
 | ⌘Return | 取用粘贴队列下一条 |
 | ⌘← / ⌘→ | 切换上一个 / 下一个收藏分组（含“历史”，循环；可在设置中更改） |
-| Space | 完整预览；预览中 ← / → 切换上一条 / 下一条，Space 或 Esc 关闭 |
+| Space | 打开或关闭完整预览，连续按三次会打开、关闭、再打开。预览中 ← / → 切换条目，Esc 关闭 |
 | ⌘E / ⌘R / ⌘O | 编辑 / 重命名（卡片标题就地修改，不改内容）/ 打开 |
 | 鼠标滚轮 | 在卡片列表中直接横向滚动 |
 | ⌘⌫ | 删除选中条目 |
@@ -99,7 +105,7 @@ OpenPaste 将复制过的文字、链接、图片和文件引用放进贴近屏�
 
 退出程序可在设置左下角点击 **退出 OpenPaste**，或从菜单栏菜单选择退出；关闭设置窗口不会退出程序。
 
-多选支持 ⌘ 点击切换条目、Shift 点击或方向键选择范围。选中多条内容后，可从面板右上角菜单选择 **所选加入粘贴队列**，再按 ⌘Return 逐条取用；点击“结束”可清空队列。代码样式是否保留，取决于目标应用是否接受 RTF / HTML；普通文本输入框仍只会收到原文。
+多选支持 ⌘ 点击切换条目、Shift 点击或方向键选择范围。双击所选卡片之一会取用整组，双击未选卡片会取用该条。也可以从面板右上角选择 **所选加入粘贴队列**，再按 ⌘Return 逐条取用。点击“结束”可清空队列。代码样式是否保留，取决于目标应用是否接受 RTF / HTML。普通文本输入框会收到原文。
 
 ## 快速翻译
 
@@ -113,7 +119,7 @@ Base URL: https://your-service.example/v1
 目标语言: 英文
 ```
 
-选中文字后呼出剪贴板，译文会出现在第一张卡片。按回车取用，在原输入框替换原选区；生成失败或未取用时不会覆盖原文。
+选中文字后呼出剪贴板，译文会出现在第一张卡片。开启回车直接粘贴且系统已授权时，按回车可在原输入框替换选区。关闭开关时可以复制译文后手动粘贴。生成失败或未取用时不会覆盖原文。
 
 - 支持 HTTP 和 HTTPS。HTTP 会明文传输 API Key 与选中文字。
 - API Key 与其他设置一同保存在本机应用配置中（`~/Library/Preferences/io.github.SwallOwDili.OpenPaste.plist`），不随剪贴板历史同步；选中文字发送到你配置的服务。
@@ -151,7 +157,7 @@ OpenPaste 无需账号，剪贴板历史默认保存在本机。以下功能会�
 | 快速翻译 | 将选中文字发送给你配置的翻译服务 |
 | 检查更新 | 向 GitHub 查询公开 Release 信息 |
 | iCloud Drive | 选择 iCloud 目录后，由 macOS 同步历史与附件 |
-| 使用统计 | 官方 Release 默认开启 Google Firebase Analytics，可在隐私设置中关闭 |
+| 使用统计 | 上游 Release 默认开启 Google Firebase Analytics，可在隐私设置中关闭。此 fork 的源码构建未配置 Firebase 时不启用统计 |
 
 OpenPaste 主动记录的统计仅包含三项，不附带内容参数：
 
@@ -179,15 +185,15 @@ Firebase SDK 还会处理应用实例标识、设备与应用版本等基础信�
 
 ## 反馈与贡献
 
-遇到问题或有功能建议，欢迎提交 [Issue](https://github.com/SwallOwDili/OpenPaste/issues)。反馈时请说明 macOS 版本和操作步骤，截图注意遮挡私人内容。
+维护分支的代码改动可以向本仓库提交 PR。反馈上游版本的问题时，请在上游说明 macOS 版本和操作步骤，并遮挡截图中的私人内容。 [本仓库 PR](https://github.com/Drangon-Li/OpenPaste/pulls) · [上游 Issues](https://github.com/SwallOwDili/OpenPaste/issues)
 
-欢迎通过 PR 贡献修复和功能。首次贡献前请阅读 [CLA 英文原文](CLA.md)或[中文译文](CLA.zh-CN.md)，并用自己的 GitHub 账号在 PR 评论中回复：
+向上游提交贡献时，请阅读上游的 [CLA 英文原文](CLA.md)或[中文译文](CLA.zh-CN.md)，并按上游 PR 中的提示用自己的 GitHub 账号回复：
 
 > I have read and agree to the OpenPaste CLA v1.0.
 
 同一版本只需签署一次；多位贡献者需逐人签署，维护者也适用。CLA 保留贡献者著作权，并允许项目商业再授权。报告问题无需签署。
 
-贡献流程见 [贡献指南](CONTRIBUTING.md)，源码构建、自动检查与发布见 [开发文档](docs/DEVELOPMENT.md)。
+上游贡献和发布流程保留在 [贡献指南](CONTRIBUTING.md) 与 [开发文档](docs/DEVELOPMENT.md) 中。开发文档中的本地构建和检查命令也可用于维护分支。
 
 ## 许可证
 
