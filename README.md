@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="Assets/AppIcon.png" width="112" alt="OpenPaste 图标" />
+  <img src="Assets/AppIcon.png" width="112" alt="GuziPaste 谷穗剪贴板图标" />
 </p>
 
-<h1 align="center">OpenPaste</h1>
+<h1 align="center">GuziPaste</h1>
 <p align="center">为 macOS 打造的剪贴板历史、收藏与快速翻译工具。</p>
 <p align="center">macOS 原生应用 · 本机存储 · 个人及公司使用免费</p>
 
@@ -11,12 +11,12 @@
 </p>
 
 <p align="center">
-  <a href="#安装">源码构建</a> ·
+  <a href="https://github.com/Drangon-Li/OpenPaste/releases/latest">下载安装包</a> ·
   <a href="#使用">使用指南</a> ·
   <a href="https://github.com/SwallOwDili/OpenPaste">上游项目</a>
 </p>
 
-OpenPaste 将复制过的文字、链接、图片和文件引用放进贴近屏幕底部的横向卡片列表。通过键盘搜索、预览和取用，也可整理收藏分组、导入 Paste 历史，或连接自己的 OpenAI 兼容翻译服务。
+GuziPaste 将复制过的文字、链接、图片和文件引用放进贴近屏幕底部的横向卡片列表。通过键盘搜索、预览和取用，也可整理收藏分组、导入 Paste 历史，或连接自己的 OpenAI 兼容翻译服务。
 
 ## 维护分支与上游
 
@@ -28,7 +28,7 @@ OpenPaste 将复制过的文字、链接、图片和文件引用放进贴近屏�
 - 改善卡片点击与多选双击取用，新增回车直接粘贴开关和开发版提示。 [上游 PR #20](https://github.com/SwallOwDili/OpenPaste/pull/20)
 - 减少面板重复绘制，加入预览关闭动画，并保留动画期间的空格切换。 [上游 PR #21](https://github.com/SwallOwDili/OpenPaste/pull/21)
 
-维护分支目前提供源码构建。签名和安装验证完成后，可在本仓库的发布页提供独立安装包。
+从 v0.2.0 起，本分支以 GuziPaste 名称和谷穗剪贴板图标发布，采用固定自签名身份。v0.1.0 使用 OpenPaste 名称和临时签名。 [维护分支 Releases](https://github.com/Drangon-Li/OpenPaste/releases)
 
 ## 界面预览
 
@@ -52,30 +52,41 @@ OpenPaste 将复制过的文字、链接、图片和文件引用放进贴近屏�
 | 快速翻译 | 呼出时翻译选中文字，译文置顶，取用后替换原选区 |
 | Paste 导入 | 本机导入历史、来源、收藏和原始格式，去重、备份并显示进度 |
 | 数据目录 | 自定义保存目录、迁移历史与附件，支持选择 iCloud Drive 文件夹 |
-| 关于与更新 | 应用介绍、许可查看、上游 Release 检查与下载入口 |
+| 关于与更新 | 查看许可，启动时检查本仓库新版本，可选择更新、稍后或跳过 |
+| 登录启动 | 登录 Mac 时自动运行，可在通用设置中开启 |
 | 记录控制 | 暂停记录、排除应用、历史条数和保留时间设置；清空历史时保留收藏 |
 
 ## 安装
 
-维护分支尚未发布安装包。体验上述改动需要 **macOS 14 或更新版本**及 **Xcode Command Line Tools**。首次构建会联网下载 Swift 依赖。
+需要 **macOS 14 或更新版本**。下载 `GuziPaste-0.2.0-macos-universal.zip`，解压后将 `GuziPaste.app` 放入「应用程序」。通用包包含 Apple Silicon 和 Intel 架构，当前已在 Apple Silicon 实机验证。 [下载 v0.2.0](https://github.com/Drangon-Li/OpenPaste/releases/tag/v0.2.0)
+
+从 v0.1.0 或上游 OpenPaste 换装时，先退出旧版并备份当前数据目录，保留旧应用副本以便回退，再将应用程序目录中的旧版移出、放入 GuziPaste。两者使用相同的应用标识和默认数据目录，GuziPaste 会继续读取现有历史、收藏及设置。
+
+安装包使用固定自签名证书，尚未经过 Apple Developer ID 签名和公证。首次打开若被 macOS 阻止，确认来源和校验值后，可在「系统设置 → 隐私与安全性」选择「仍要打开」。从临时签名版首次换装后，直接粘贴可能需要在「辅助功能」中重新授权 GuziPaste。 [Apple 打开说明](https://support.apple.com/zh-cn/102445)
+
+ZIP 同页提供 SHA-256 文件。下载两个文件到同一目录后，可运行 `shasum -a 256 -c GuziPaste-0.2.0-macos-universal.sha256` 核对。
+
+如需从源码构建，安装 **Xcode Command Line Tools** 后执行以下命令，首次构建会联网下载 Swift 依赖。
 
 ```sh
 xcode-select --install  # 已安装时可跳过
 git clone https://github.com/Drangon-Li/OpenPaste.git
 cd OpenPaste
 ./build.sh
-open build/OpenPaste.app
+open build/GuziPaste.app
 ```
 
-源码构建沿用上游的应用标识和默认数据目录，会读取已有的本机配置及历史。切换版本前先退出正在运行的 OpenPaste，并备份历史目录。源码构建默认使用临时签名，重新构建后如需恢复直接粘贴，可在 **系统设置 → 隐私与安全性 → 辅助功能** 中为当前应用重新授权。
+源码构建默认使用临时签名。使用固定签名构建的方法见开发文档，重新构建后如需恢复直接粘贴，可在 **系统设置 → 隐私与安全性 → 辅助功能** 中为当前应用重新授权。 [开发文档](docs/DEVELOPMENT.md)
 
 上游提供自己的通用安装包，安装说明与签名情况见上游发行页。 [上游 Releases](https://github.com/SwallOwDili/OpenPaste/releases)
 
 ## 检查更新
 
-维护分支目前通过 GitHub 源码更新。已克隆的副本可以执行 `git pull --ff-only`，然后重新运行 `./build.sh`。
+「设置 → 关于 → 软件更新」中的自动检查开启后，每次启动会异步查询本仓库，持续运行时每天检查一次。新安装默认开启，已有明确开关设置会保留。发现新版时可选择更新、稍后或跳过，手动检查可重新查看被跳过的版本。 [维护分支 Releases](https://github.com/Drangon-Li/OpenPaste/releases)
 
-菜单栏和「设置 → 关于 → 软件更新」里的检查仍查询上游 Release，自动检查默认关闭。应用内安装需要校验 SHA-256、应用标识和签名，默认临时签名的源码构建请使用上述重新构建方式获取维护分支的改动。 [维护分支源码](https://github.com/Drangon-Li/OpenPaste)
+应用内更新校验 SHA-256、应用标识、版本和签名。固定证书签名的版本可更新到同一身份的新版。从临时签名的 v0.1.0 换到首个固定签名版，需要手动替换，并可能重新授予辅助功能权限。后续版本应持续使用同一证书，macOS 仍可能因系统或安装状态要求重新授权。
+
+源码副本可执行 `git pull --ff-only` 并重新运行 `./build.sh`。在「设置 → 通用 → 启动」可开启登录 Mac 时启动 GuziPaste，系统要求批准时会提供登录项设置入口。
 
 ## 使用
 
@@ -103,7 +114,7 @@ open build/OpenPaste.app
 | ⌘, | 设置 |
 | Esc | 关闭当前面板或设置窗口 |
 
-退出程序可在设置左下角点击 **退出 OpenPaste**，或从菜单栏菜单选择退出；关闭设置窗口不会退出程序。
+退出程序可在设置左下角点击 **退出 GuziPaste**，或从菜单栏菜单选择退出；关闭设置窗口不会退出程序。
 
 多选支持 ⌘ 点击切换条目、Shift 点击或方向键选择范围。双击所选卡片之一会取用整组，双击未选卡片会取用该条。也可以从面板右上角选择 **所选加入粘贴队列**，再按 ⌘Return 逐条取用。点击“结束”可清空队列。代码样式是否保留，取决于目标应用是否接受 RTF / HTML。普通文本输入框会收到原文。
 
@@ -141,7 +152,7 @@ Base URL: https://your-service.example/v1
 
 在「设置 → 数据管理 → 更改目录」选择专用文件夹。历史、收藏和附件一起迁移，目标已有历史会合并；迁移显示进度，校验成功后切换，源目录保留。
 
-选择 **iCloud Drive** 中的文件夹后，由 macOS 同步文件。另一台 Mac 选择同一 Apple 账户下的同一个文件夹，即可读取和合并历史。
+在「设置 → 数据管理 → iCloud Drive 同步」选择 **启用 iCloud Drive 同步**，选择 iCloud Drive 中的专用文件夹。另一台 Mac 使用同一 Apple 账户并选择同一文件夹，可读取和合并历史。界面显示本机缓存、等待同步及读写结果，并提供检查或重试入口。云端暂不可用时，成功写入本机缓存的新增内容可继续记录；缓存也无法保存时会暂停记录并提示处理。
 
 同步速度取决于 iCloud 和网络，可能存在延迟。为保护离线设备仍可能引用的内容，共享目录中的附件不会自动回收；本地历史与本机离线缓存会回收无引用附件，撤销记录和备份仍需使用的附件会保留。请勿单独移动或删除数据目录内的文件。
 
@@ -149,7 +160,7 @@ Base URL: https://your-service.example/v1
 
 ## 隐私与限制
 
-OpenPaste 无需账号，剪贴板历史默认保存在本机。以下功能会使用网络：
+GuziPaste 无需账号，剪贴板历史默认保存在本机。以下功能会使用网络：
 
 | 功能 | 联网用途 |
 | --- | --- |

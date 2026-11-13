@@ -94,6 +94,34 @@ private final class SaveGeneration {
     func next() -> Int { lock.lock(); defer { lock.unlock() }; value += 1; return value }
     func isCurrent(_ generation: Int) -> Bool { lock.lock(); defer { lock.unlock() }; return generation == value }
 }
+
+private final class SyncEdits {
+    private var baselineVersion: Int?
+    private var latest: SyncSnapshot?
+    private var cachedRoot: URL?
+    private var cachedSnapshot: SyncSnapshot?
+
+    // This state belongs to the persistence queue. A coalesced save still records
+    // its edits so a later delete can leave a tombstone for a short-lived clip.
+    func record(_ archive: Archive, from baseline: SyncSnapshot, version: Int, at time: TimeInterval) -> SyncSnapshot {
+        let previous = baselineVersion == version ? latest ?? baseline : baseline
+        let updated = DataDirectory.changes(archive, from: previous, at: time)
+        baselineVersion = version
+        latest = updated
+        return updated
+    }
+
+    func cache(_ snapshot: SyncSnapshot, at root: URL) throws -> SyncSnapshot {
+        let merged = cachedRoot == root ? cachedSnapshot.map { DataDirectory.merge(snapshot, $0) } ?? snapshot : snapshot
+        if cachedRoot != root || cachedSnapshot?.index != merged.index {
+            try DataDirectory.cache(merged, root: root)
+            cachedRoot = root
+            cachedSnapshot = merged
+        }
+        return merged
+    }
+}
+
 final class Store: ObservableObject {
     @Published var archive = Archive() { didSet { rebuildSources(); refreshResults() } }
     @Published var paused = false
@@ -177,9 +205,17 @@ final class Store: ObservableObject {
     @Published var changingDataDirectory = false
     @Published var directoryStatus = ""
     @Published var directoryProgress = ImportProgress(phase: "", completed: 0, total: 0)
-    var syncBaseline = DataDirectory.baseline(Archive())
-    var syncStamp = ""
+    @Published var isICloudDirectory = false
+    @Published var directorySyncStatus = ""
+    @Published var directorySyncInProgress = false
+    var usesSharedDirectory = false
+    var syncBaseline = DataDirectory.baseline(Archive()) { didSet { syncBaselineVersion += 1 } }
+    private(set) var syncBaselineVersion = 0
+    private let syncEdits = SyncEdits()
+    var syncStamp: String?
+    var needsDirectorySync = false
     var initialDirectoryLoadFailed = false
+    private(set) var savePending = false
     private var storageRetryInFlight = false
     // Recording stays paused after a failed save, and only a save can clear that pause. Retry on a
     // growing delay so a transient failure (such as a momentarily full disk) cannot pause recording for good.
@@ -226,55 +262,65 @@ final class Store: ObservableObject {
             paused = pauseReasons.isPaused
         }
         let asynchronousInitialLoad = !ephemeral && loadHistoryAsynchronously
-        if !ephemeral {
+        if asynchronousInitialLoad {
+            initialLoading = true
+            changingDataDirectory = true
+            directoryStatus = "正在读取历史…"
+            directoryProgress = ImportProgress(phase: "正在读取历史", completed: 0, total: 0)
+            pauseReasons.beginTemporaryPause()
+            paused = pauseReasons.isPaused
+        } else if !ephemeral {
+            isICloudDirectory = DataDirectory.isCloud(self.root)
+            usesSharedDirectory = isICloudDirectory || DataDirectory.usesSync(self.root)
             do {
-                try FileManager.default.createDirectory(at: self.root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-                _ = try AppEnvironment.current.validateDataRoot(self.root)
-                if asynchronousInitialLoad {
-                    initialLoading = true
-                    changingDataDirectory = true
-                    directoryStatus = "正在读取历史…"
-                    directoryProgress = ImportProgress(phase: "正在读取历史", completed: 0, total: 0)
-                    pauseReasons.beginTemporaryPause()
-                    paused = pauseReasons.isPaused
-                } else {
-                    let file = self.root.appendingPathComponent("history.json")
-                    if DataDirectory.usesSync(self.root) || FileManager.default.fileExists(atPath: file.path) {
-                        syncBaseline = try Self.loadInitialHistory(from: self.root)
-                        archive = syncBaseline.archive
-                        // A successful migration must survive a crash before preference updates.
-                        storageLimitMB = max(storageLimitMB, (archive.clips.reduce(0) { $0 + $1.byteCount } + 1048575) / 1048576)
-                        if limit != 0 { limit = max(limit, archive.clips.filter { $0.boards.isEmpty }.count) }
-                        prune()
-                    }
-                }
+                let loaded = try Self.readInitialHistory(from: self.root, cloud: isICloudDirectory, shared: usesSharedDirectory)
+                syncBaseline = loaded
+                archive = loaded.archive
+                // A successful migration must survive a crash before preference updates.
+                storageLimitMB = max(storageLimitMB, (archive.clips.reduce(0) { $0 + $1.byteCount } + 1048575) / 1048576)
+                if limit != 0 { limit = max(limit, archive.clips.filter { $0.boards.isEmpty }.count) }
+                prune()
+                if isICloudDirectory { directorySyncStatus = Self.checkedICloudStatus }
             } catch {
-                setRecordingLoadFailure(error.localizedDescription)
-                if DataDirectory.isCloud(self.root) {
-                    directoryStatus = "等待同步：\(error.localizedDescription)"; initialDirectoryLoadFailed = true
-                    if let cached = try? DataDirectory.cached(self.root) { syncBaseline = cached; archive = cached.archive }
+                if usesSharedDirectory {
+                    setDirectorySyncWaiting(error)
+                    if let cached = try? DataDirectory.cached(self.root) {
+                        syncBaseline = cached
+                        archive = cached.archive
+                    } else {
+                        initialDirectoryLoadFailed = true
+                        setRecordingLoadFailure(error.localizedDescription)
+                    }
+                } else {
+                    setRecordingLoadFailure(error.localizedDescription)
                 }
             }
         }
         rebuildSources()
         refreshResults()
         if asynchronousInitialLoad, initialLoading {
-            beginInitialHistoryLoad(using: initialHistoryLoader ?? Self.loadInitialHistory)
+            beginInitialHistoryLoad(using: initialHistoryLoader)
         }
     }
-    private static func loadInitialHistory(from root: URL) throws -> SyncSnapshot {
-        var snapshot = try DataDirectory.load(root)
-        if DataDirectory.usesSync(root), let cached = try DataDirectory.cached(root) { snapshot = DataDirectory.merge(snapshot, cached) }
+    private static func readInitialHistory(from root: URL, cloud: Bool, shared: Bool, using loader: ((URL) throws -> SyncSnapshot)? = nil) throws -> SyncSnapshot {
+        if !cloud {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            _ = try AppEnvironment.current.validateDataRoot(root)
+        }
+        let snapshot = try loader?(root) ?? DataDirectory.load(root)
+        if shared, let cached = try DataDirectory.cached(root) { return DataDirectory.merge(snapshot, cached) }
         return snapshot
     }
-    private func beginInitialHistoryLoad(using loader: @escaping (URL) throws -> SyncSnapshot) {
+    private func beginInitialHistoryLoad(using loader: ((URL) throws -> SyncSnapshot)?) {
         let folder = root
         let generation = directoryMutation
         persistenceQueue.async { [weak self] in
             let finishLoad = AcceptanceMetrics.begin("history.initial-load.background")
-            let result = Result { try loader(folder) }
+            let cloud = DataDirectory.isCloud(folder)
+            let shared = cloud || DataDirectory.usesSync(folder)
+            let result = Result { try Self.readInitialHistory(from: folder, cloud: cloud, shared: shared, using: loader) }
             let cached: SyncSnapshot?
-            if case .failure = result, DataDirectory.isCloud(folder) { cached = try? DataDirectory.cached(folder) }
+            if case .failure = result, shared { cached = try? DataDirectory.cached(folder) }
             else { cached = nil }
             finishLoad()
             DispatchQueue.main.async {
@@ -282,24 +328,28 @@ final class Store: ObservableObject {
                       self.directoryMutation == generation else { return }
                 let finishInstall = AcceptanceMetrics.begin("history.initial-install")
                 defer { finishInstall() }
+                self.isICloudDirectory = cloud
+                self.usesSharedDirectory = shared
+                self.directoryStatus = ""
                 var loaded = false
                 switch result {
                 case .success(let snapshot):
                     self.syncBaseline = snapshot
                     self.installLoadedArchive(snapshot.archive)
                     self.initialDirectoryLoadFailed = false
-                    self.directoryStatus = DataDirectory.usesSync(folder) ? "已读取 iCloud 历史；上传与下载由系统完成。" : ""
+                    if cloud { self.directorySyncStatus = Self.checkedICloudStatus }
                     loaded = true
                 case .failure(let error):
                     if let cached {
                         self.syncBaseline = cached
                         self.installLoadedArchive(cached.archive)
+                        loaded = true
+                    } else {
+                        self.setRecordingLoadFailure(error.localizedDescription)
                     }
-                    self.setRecordingLoadFailure(error.localizedDescription)
-                    self.directoryStatus = ""
-                    if DataDirectory.isCloud(folder) {
-                        self.directoryStatus = "等待同步：\(error.localizedDescription)"
-                        self.initialDirectoryLoadFailed = true
+                    if shared {
+                        self.setDirectorySyncWaiting(error)
+                        self.initialDirectoryLoadFailed = !loaded
                     }
                 }
                 self.initialLoading = false
@@ -398,27 +448,43 @@ final class Store: ObservableObject {
     }
     func save() {
         guard !ephemeral, !initialLoading, !changingDataDirectory, !importingPaste, pauseReasons.loadFailure == nil else { return }
+        savePending = true
         directoryMutation += 1
         let snapshot = archive
         let undoClips = undoItems.flatMap(\.clips)
         let folder = root
-        let cloud = DataDirectory.usesSync(folder)
-        if cloud { syncBaseline = DataDirectory.changes(snapshot, from: syncBaseline) }
         let baseline = syncBaseline
-        let device = cloud ? deviceIDForPersistence() : ""
+        let baselineVersion = syncBaselineVersion
+        let time = Date().timeIntervalSince1970
+        let knownShared = usesSharedDirectory
+        let edits = syncEdits
         let mutation = directoryMutation
         let generation = saveGeneration.next()
         let gate = saveGeneration
         let url = root.appendingPathComponent("history.json")
         persistenceQueue.async { [weak self] in
+            guard let self else { return }
+            let cloud = knownShared || DataDirectory.usesSync(folder)
+            let local = cloud ? edits.record(snapshot, from: baseline, version: baselineVersion, at: time) : nil
             guard gate.isCurrent(generation) else { return }
             var savedBaseline: SyncSnapshot?
+            var historyChanged = false
+            var syncError: Error?
             do {
-                if cloud {
-                    try DataDirectory.cache(baseline, root: folder)
-                    let merged = DataDirectory.merge(try DataDirectory.load(folder), DataDirectory.changes(snapshot, from: baseline))
-                    try DataDirectory.write(merged, root: folder, device: device)
-                    savedBaseline = merged
+                if let local {
+                    let durable = try edits.cache(local, at: folder)
+                    do {
+                        let remote = try DataDirectory.load(folder)
+                        let merged = DataDirectory.merge(remote, durable)
+                        if merged.index != remote.index {
+                            try DataDirectory.write(merged, root: folder, device: self.deviceIDForPersistence())
+                        }
+                        savedBaseline = try edits.cache(merged, at: folder)
+                        historyChanged = savedBaseline?.index != local.index
+                    } catch {
+                        // The local revisions are durable, so a cloud error only delays publication.
+                        syncError = error
+                    }
                 } else {
                     try DataDirectory.coordinated(url, writing: true) { path in try HistoryStorage.write(snapshot, to: path) }
                 }
@@ -430,11 +496,15 @@ final class Store: ObservableObject {
                         try HistoryStorage.collectUnused(at: path, preserving: undoClips)
                     }
                 }
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
                     guard let self, gate.isCurrent(generation), self.root == folder, self.directoryMutation == mutation, !self.changingDataDirectory else { return }
+                    self.savePending = false
+                    self.usesSharedDirectory = cloud
                     if let savedBaseline {
-                        self.syncBaseline = savedBaseline; self.archive = savedBaseline.archive
-                        self.directoryStatus = "已保存到 iCloud 目录；上传与下载由系统完成。"
+                        self.installSyncedSnapshot(savedBaseline, updateArchive: historyChanged)
+                        self.setDirectorySyncChecked()
+                    } else if let syncError {
+                        self.setDirectorySyncWaiting(syncError)
                     }
                     self.storageRetryInFlight = false
                     let recovered = self.pauseReasons.saveFailure != nil
@@ -445,10 +515,11 @@ final class Store: ObservableObject {
                 let detail = error.localizedDescription
                 // Only the error code is recorded (no paths or content), so a later report can tell a full disk from other failures.
                 AppDiagnostics.record("storage.save-failed", ["code": String((error as NSError).code), "cloud": cloud ? "1" : "0"])
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
                     guard let self, gate.isCurrent(generation), self.root == folder, self.directoryMutation == mutation, !self.changingDataDirectory else { return }
+                    self.savePending = false
                     self.storageRetryInFlight = false
-                    if cloud { self.directoryStatus = "等待同步：\(detail)" }
+                    if cloud { self.directorySyncStatus = "本机缓存保存失败：\(detail)" }
                     self.setRecordingSaveFailure(detail)
                 }
             }
@@ -495,6 +566,40 @@ final class Store: ObservableObject {
         }
         pollDirectory()
     }
+
+    func retryDirectorySync() {
+        if pauseReasons.hasStorageFailure { retryRecordingStorage() }
+        else { pollDirectory(force: true) }
+    }
+
+    static let checkedICloudStatus = "已检查 iCloud Drive 中的历史。macOS 负责设备间传输。"
+
+    func setDirectorySyncChecked() {
+        needsDirectorySync = false
+        if isICloudDirectory, directorySyncStatus != Self.checkedICloudStatus {
+            directorySyncStatus = Self.checkedICloudStatus
+        }
+    }
+
+    func setDirectorySyncWaiting(_ error: Error) {
+        needsDirectorySync = true
+        if isICloudDirectory {
+            let detail = "等待 iCloud 同步：\(error.localizedDescription)"
+            if directorySyncStatus != detail { directorySyncStatus = detail }
+        }
+    }
+
+    func cacheSyncedSnapshot(_ snapshot: SyncSnapshot, at folder: URL) throws -> SyncSnapshot {
+        try syncEdits.cache(snapshot, at: folder)
+    }
+
+    func installSyncedSnapshot(_ snapshot: SyncSnapshot, updateArchive: Bool) {
+        syncBaseline = snapshot
+        if updateArchive {
+            archive = snapshot.archive
+            discardMissingQueueItems()
+        }
+    }
     func setUserPaused(_ value: Bool) {
         if initialLoading, pauseReasons.userPaused, !value { freezeInitialResume = true }
         pauseReasons.setUserPaused(value)
@@ -539,14 +644,14 @@ final class Store: ObservableObject {
             storageRetryInFlight = true
             let folder = root, mutation = directoryMutation
             persistenceQueue.async { [weak self] in
-                let result = Result { () throws -> SyncSnapshot in
-                    var snapshot = try DataDirectory.load(folder)
-                    if DataDirectory.usesSync(folder), let cached = try DataDirectory.cached(folder) { snapshot = DataDirectory.merge(snapshot, cached) }
-                    return snapshot
-                }
+                let cloud = DataDirectory.isCloud(folder)
+                let shared = cloud || DataDirectory.usesSync(folder)
+                let result = Result { try Self.readInitialHistory(from: folder, cloud: cloud, shared: shared) }
                 DispatchQueue.main.async {
                     guard let self, self.root == folder, self.directoryMutation == mutation, !self.changingDataDirectory else { return }
                     self.storageRetryInFlight = false
+                    self.isICloudDirectory = cloud
+                    self.usesSharedDirectory = shared
                     switch result {
                     case .success(let snapshot):
                         self.syncBaseline = snapshot
@@ -554,9 +659,11 @@ final class Store: ObservableObject {
                         self.initialDirectoryLoadFailed = false
                         self.setRecordingLoadFailure(nil)
                         self.message = self.storageDescription
-                        self.directoryStatus = DataDirectory.usesSync(folder) ? "已读取 iCloud 历史；上传与下载由系统完成。" : ""
+                        self.setDirectorySyncChecked()
                         self.resumeDeferredInitialStart()
-                    case .failure(let error): self.setRecordingLoadFailure(error.localizedDescription)
+                    case .failure(let error):
+                        if shared { self.setDirectorySyncWaiting(error) }
+                        self.setRecordingLoadFailure(error.localizedDescription)
                     }
                 }
             }
@@ -584,6 +691,7 @@ final class Store: ObservableObject {
         directoryMutation += 1
         storageCallbackGeneration += 1
         _ = saveGeneration.next()
+        savePending = false
         storageRetryInFlight = false
     }
     func beginTemporaryPause() {

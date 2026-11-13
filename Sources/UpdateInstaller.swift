@@ -22,8 +22,8 @@ enum UpdateInstallError: LocalizedError, Equatable {
     var errorDescription: String? {
         switch self {
         case .notInstalledApp: return "当前不是从 .app 运行，无法应用内更新"
-        case .translocated: return "应用正在系统的临时路径中运行，请先把 OpenPaste 移到「应用程序」文件夹再更新"
-        case .adHocSigned: return "当前版本使用临时签名，无法验证新版来源，请手动下载一次"
+        case .translocated: return "应用正在系统的临时路径中运行，请先把 GuziPaste 移到「应用程序」文件夹再更新"
+        case .adHocSigned: return "当前版本使用临时签名。请手动安装固定签名的 GuziPaste，并重新授予一次辅助功能权限"
         case .unsigned: return "当前版本没有有效签名，无法验证新版来源，请手动下载"
         case .notWritable: return "应用所在目录不可写，无法替换，请手动下载安装"
         case .badAsset: return "更新资源地址无效"
@@ -74,7 +74,7 @@ enum UpdateVerification {
     }
     static func isTranslocated(_ url: URL) -> Bool { url.path.contains("/AppTranslocation/") }
     /// The extracted archive must hold exactly one application bundle and nothing else (ignoring resource-fork folders).
-    static func isExpectedArchiveLayout(_ names: [String], appName: String = "OpenPaste.app") -> Bool {
+    static func isExpectedArchiveLayout(_ names: [String], appName: String) -> Bool {
         let rest = names.filter { $0 != "__MACOSX" && $0 != ".DS_Store" }
         return rest == [appName]
     }
@@ -156,8 +156,8 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
     func prepare(_ release: GitHubRelease) {
         guard !busy else { return }
         if let reason = blockingReason() { fail(reason); return }
-        guard let zipName = release.installerName, let sumName = release.checksumName,
-              let zipURL = release.assetURL(zipName), let sumURL = release.assetURL(sumName) else { fail(.checksumMissing); return }
+        guard let installer = release.installer,
+              let zipURL = release.assetURL(installer.zipName), let sumURL = release.assetURL(installer.checksumName) else { fail(.checksumMissing); return }
         discardPrepared()
         generation += 1
         let current = generation
@@ -171,9 +171,9 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
                 await MainActor.run { self.workDirectory = work }
                 let sumFile = try await self.download(sumURL, limit: 4096, to: work.appendingPathComponent("checksum"), generation: current)
                 guard let sumText = try? String(contentsOf: sumFile, encoding: .utf8),
-                      let expected = UpdateVerification.expectedChecksum(from: sumText, fileName: zipName) else { throw UpdateInstallError.checksumMissing }
-                let zipFile = try await self.download(zipURL, limit: UpdateVerification.sizeLimit, to: work.appendingPathComponent(zipName), generation: current)
-                try await self.verifyAndStage(zip: zipFile, expected: expected, release: release, generation: current)
+                      let expected = UpdateVerification.expectedChecksum(from: sumText, fileName: installer.zipName) else { throw UpdateInstallError.checksumMissing }
+                let zipFile = try await self.download(zipURL, limit: UpdateVerification.sizeLimit, to: work.appendingPathComponent(installer.zipName), generation: current)
+                try await self.verifyAndStage(zip: zipFile, expected: expected, appName: installer.appName, release: release, generation: current)
                 await MainActor.run {
                     guard self.generation == current else { return }
                     self.phase = .ready; self.message = "\(release.version) 已下载并验证，可重启安装"
@@ -245,7 +245,7 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
         let location: URL = try await withCheckedThrowingContinuation { continuation in
             self.continuation = continuation
             var request = URLRequest(url: url)
-            request.setValue("OpenPaste-UpdateInstaller", forHTTPHeaderField: "User-Agent")
+            request.setValue("GuziPaste-UpdateInstaller", forHTTPHeaderField: "User-Agent")
             let task = session.downloadTask(with: request)
             self.task = task
             task.resume()
@@ -292,7 +292,7 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
 
     // MARK: Verify and stage
 
-    private func verifyAndStage(zip: URL, expected: String, release: GitHubRelease, generation current: Int) async throws {
+    private func verifyAndStage(zip: URL, expected: String, appName: String, release: GitHubRelease, generation current: Int) async throws {
         guard generation == current else { throw UpdateInstallError.cancelled }
         await MainActor.run { self.phase = .verifying; self.message = "正在校验…" }
         guard try UpdateVerification.sha256(of: zip) == expected else { throw UpdateInstallError.checksumMismatch }
@@ -311,8 +311,8 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
         do { try ditto.run(); ditto.waitUntilExit() } catch { throw UpdateInstallError.extraction }
         guard ditto.terminationStatus == 0 else { throw UpdateInstallError.extraction }
         let names = (try? fileManager.contentsOfDirectory(atPath: staging.path)) ?? []
-        guard UpdateVerification.isExpectedArchiveLayout(names) else { throw UpdateInstallError.unexpectedContents }
-        let app = staging.appendingPathComponent("OpenPaste.app", isDirectory: true)
+        guard UpdateVerification.isExpectedArchiveLayout(names, appName: appName) else { throw UpdateInstallError.unexpectedContents }
+        let app = staging.appendingPathComponent(appName, isDirectory: true)
         try Self.verifyBundle(app, release: release, requirement: Self.currentRequirement(), expectedIdentifier: Bundle.main.bundleIdentifier)
         await MainActor.run { self.stagedApp = app }
     }
@@ -359,9 +359,9 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
         fi
         /bin/rm -rf "$STAGING" "$WORK"
         # Relaunch exactly as started, so an isolated acceptance profile never turns into the user's real one.
-        # -n starts this path even if another copy with the same bundle id is running; plain open would only activate that copy.
+        # LaunchServices changes the working directory, so acceptance launches run directly to preserve their isolation gate.
         if [ -n "$OPENPASTE_ACCEPTANCE_ROOT" ]; then
-          /usr/bin/open -n --env "OPENPASTE_ACCEPTANCE_ROOT=$OPENPASTE_ACCEPTANCE_ROOT" "$APP" --args "$@"
+          exec "$APP/Contents/MacOS/OpenPaste" "$@"
         else
           /usr/bin/open -n "$APP" --args "$@"
         fi
@@ -372,6 +372,7 @@ final class UpdateInstaller: NSObject, ObservableObject, URLSessionDownloadDeleg
             try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: script.path)
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
+            process.currentDirectoryURL = URL(fileURLWithPath: fileManager.currentDirectoryPath, isDirectory: true)
             process.arguments = [script.path, bundleURL.path, staged.path, String(ProcessInfo.processInfo.processIdentifier), staging.path, work.path] + CommandLine.arguments.dropFirst()
             process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice; process.standardInput = FileHandle.nullDevice
             try process.run()

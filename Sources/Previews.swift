@@ -47,10 +47,12 @@ final class PreviewCache {
         if let icon = icons.object(forKey: bundleID as NSString) { return icon }
         if bundleID == Bundle.main.bundleIdentifier {
             let finishTiming = AcceptanceMetrics.begin("preview.icon.self"); defer { finishTiming() }
-            if let url = Bundle.main.url(forResource: "OpenPaste-v2", withExtension: "icns"), let icon = NSImage(contentsOf: url) {
-                icons.setObject(icon, forKey: bundleID as NSString)
-                return icon
-            }
+            guard let file = Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") as? String else { return nil }
+            let filename = (file as NSString).pathExtension.isEmpty ? file + ".icns" : file
+            guard let url = Bundle.main.url(forResource: filename, withExtension: nil),
+                  let icon = NSImage(contentsOf: url) else { return nil }
+            icons.setObject(icon, forKey: bundleID as NSString)
+            return icon
         }
         guard !bundleID.isEmpty, !missingIcons.contains(bundleID) else { return nil }
         let finishTiming = AcceptanceMetrics.begin("preview.icon.load"); defer { finishTiming() }

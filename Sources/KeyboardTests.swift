@@ -438,14 +438,19 @@ func runPreviewToggleTests(controller: Controller) async {
     let panel = controller.panel!
     var checks = 0
     var failures = 0
-    var closingObservations = 0
-    var synchronousCloses = 0
+    var reversals = 0
+    var maxDispatchMilliseconds = 0.0
+    var coldOpenMilliseconds: Double?
+    var maxWarmOpenMilliseconds = 0.0
+    var maxCloseMilliseconds = 0.0
+    var maxReverseMilliseconds = 0.0
+    let reducedMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
     var stage = "setup"
     func check(_ value: Bool, _ label: String) {
         checks += 1
         guard !value else { return }
         failures += 1
-        print("FAIL: preview-toggle stage=\(stage) check=\(label) closing=\(controller.previewClosing) popoverShown=\(controller.previewPopover?.isShown == true) tracked=\(controller.previewPopover != nil) active=\(NSApp.isActive) panelVisible=\(panel.isVisible) panelKey=\(panel.isKeyWindow) settings=\(store.settings) editorVisible=\(controller.editorWindow?.isVisible == true)")
+        print("FAIL: preview-toggle stage=\(stage) check=\(label) closing=\(controller.previewClosing) popoverShown=\(controller.previewPopover?.isShown == true) alpha=\(controller.previewWindow?.alphaValue ?? -1) tracked=\(controller.previewPopover != nil) active=\(NSApp.isActive) panelVisible=\(panel.isVisible) panelKey=\(panel.isKeyWindow) settings=\(store.settings) editorVisible=\(controller.editorWindow?.isVisible == true)")
         fflush(stdout)
     }
     func pause(_ milliseconds: UInt64) async {
@@ -458,14 +463,7 @@ func runPreviewToggleTests(controller: Controller) async {
         }
     }
     func send(_ type: NSEvent.EventType, code: UInt16 = 49, characters: String = " ", repeating: Bool = false) {
-        let window: NSWindow?
-        if controller.previewClosing {
-            window = panel.isVisible ? panel : nil
-        } else if let current = NSApp.keyWindow, current.isVisible {
-            window = current
-        } else {
-            window = panel.isVisible ? panel : nil
-        }
+        let window = NSApp.keyWindow.flatMap { $0.isVisible ? $0 : nil } ?? (panel.isVisible ? panel : nil)
         guard let window, let event = NSEvent.keyEvent(with: type, location: .zero, modifierFlags: [],
             timestamp: ProcessInfo.processInfo.systemUptime, windowNumber: window.windowNumber,
             context: nil, characters: characters, charactersIgnoringModifiers: characters,
@@ -473,19 +471,51 @@ func runPreviewToggleTests(controller: Controller) async {
             check(false, "visible event destination exists")
             return
         }
+        let wasClosing = controller.previewClosing
+        let wasShown = controller.previewPopover?.isShown == true
+        let start = ProcessInfo.processInfo.systemUptime
         NSApp.sendEvent(event)
+        if type == .keyDown, code == 49, !repeating {
+            let elapsed = (ProcessInfo.processInfo.systemUptime - start) * 1_000
+            maxDispatchMilliseconds = max(maxDispatchMilliseconds, elapsed)
+            if wasClosing { maxReverseMilliseconds = max(maxReverseMilliseconds, elapsed) }
+            else if wasShown { maxCloseMilliseconds = max(maxCloseMilliseconds, elapsed) }
+            else if coldOpenMilliseconds == nil { coldOpenMilliseconds = elapsed }
+            else { maxWarmOpenMilliseconds = max(maxWarmOpenMilliseconds, elapsed) }
+        }
     }
     func tap(_ code: UInt16 = 49, _ characters: String = " ") {
         send(.keyDown, code: code, characters: characters)
         send(.keyUp, code: code, characters: characters)
     }
-    func observeClose() {
-        if controller.previewClosing { closingObservations += 1 }
-        else { synchronousCloses += 1 }
-    }
     func verifyOpen(_ expected: Bool, _ label: String) {
-        check(!controller.previewClosing && (controller.previewPopover?.isShown == true) == expected &&
-              (expected || controller.previewPopover == nil), label)
+        if expected {
+            check(!controller.previewClosing && controller.previewWindow?.isVisible == true &&
+                  controller.previewWindow?.alphaValue == 1 && controller.previewClipID != nil, label)
+        } else {
+            check(!controller.previewClosing && controller.previewPopover == nil && controller.previewWindow == nil &&
+                  controller.previewClipID == nil, label)
+        }
+    }
+    func toggleAndCheck(open: Bool) {
+        let reversing = controller.previewClosing
+        let previous = controller.previewPopover
+        let host = controller.previewHost
+        tap()
+        if open {
+            check(!controller.previewClosing && controller.previewWindow?.isVisible == true &&
+                  controller.previewClipID == store.selected, "key immediately starts opening the selected clip")
+            if reversing {
+                reversals += 1
+                check(controller.previewPopover === previous && controller.previewHost === host,
+                      "reversal keeps the current popover and hosting controller")
+            }
+        } else if reducedMotion {
+            verifyOpen(false, "key immediately closes with reduced motion")
+        } else {
+            check(controller.previewClosing && controller.previewPopover === previous && controller.previewWindow?.isVisible == true,
+                  "key immediately starts closing the current popover")
+        }
     }
     func reset(_ name: String) async {
         stage = name
@@ -499,27 +529,64 @@ func runPreviewToggleTests(controller: Controller) async {
         check(NSApp.isActive && panel.isKeyWindow, "shelf owns keyboard focus")
     }
     func settle(_ expected: Bool) async {
-        await pause(650)
+        await pause(180)
         verifyOpen(expected, "final preview state")
         let identity = controller.previewClipID
-        await pause(350)
+        await pause(140)
         verifyOpen(expected, "late close callbacks preserve final state")
         check(controller.previewClipID == identity, "late callbacks preserve preview identity")
     }
-    func pendingOpen(_ name: String) async {
+    func reverseOpen(_ name: String) async {
         await reset(name)
-        tap()
-        check(controller.previewPopover?.isShown == true, "first press opens native popover")
-        tap()
-        observeClose()
-        tap()
+        toggleAndCheck(open: true)
+        toggleAndCheck(open: false)
+        toggleAndCheck(open: true)
+    }
+    func shelfScrollView(in view: NSView) -> NSScrollView? {
+        if let scroll = view as? NSScrollView, let document = scroll.documentView,
+           document.frame.width > scroll.contentSize.width + 80,
+           document.frame.height <= scroll.contentSize.height + 1 { return scroll }
+        for child in view.subviews {
+            if let scroll = shelfScrollView(in: child) { return scroll }
+        }
+        return nil
+    }
+    func checkShelfReopen() async {
+        await reset("first-card-reopen")
+        await waitUntil { panel.contentView.flatMap(shelfScrollView) != nil }
+        guard let first = store.filtered.first, let scroll = panel.contentView.flatMap(shelfScrollView) else {
+            check(false, "first card and horizontal scroller are laid out")
+            return
+        }
+        let original = scroll.contentView.bounds.origin
+        check(abs(original.x) <= 1, "initial scroll origin leaves the first card inset visible")
+        if AppEnvironment.current.defaults.double(forKey: "shelfHeight") == 0, let screen = panel.screen {
+            let expected = min(360, screen.frame.height * 0.75)
+            check(abs(panel.frame.height - expected) <= 1, "fresh profile opens at the 360-point default height")
+        }
+        scroll.contentView.scroll(to: NSPoint(x: original.x + 80, y: original.y))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        check(scroll.contentView.bounds.minX >= original.x + 79 && store.selected == first.id,
+              "scrolling clips the first card without changing its selection")
+        panel.orderOut(nil)
+        controller.showShelf()
+        await waitUntil {
+            guard let reopened = panel.contentView.flatMap(shelfScrollView) else { return false }
+            return abs(reopened.contentView.bounds.minX - original.x) <= 1
+        }
+        let reopenedOffset = panel.contentView.flatMap(shelfScrollView)?.contentView.bounds.minX
+        check(panel.isVisible && store.selected == first.id && reopenedOffset.map { abs($0 - original.x) <= 1 } == true,
+              "reopening at the same selection restores the first card inset")
     }
     defer {
         controller.closePreview(animated: false)
         controller.editorWindow?.close()
         controller.settingsWindow?.close()
         panel.orderOut(nil)
-        print("\(failures == 0 ? "PASS" : "FAIL"): preview-toggle summary checks=\(checks) failures=\(failures) nativeClosing=\(closingObservations) synchronousCloses=\(synchronousCloses)")
+        print(String(format: "Preview-toggle space dispatch ms: cold-open=%.1f max-warm-open=%.1f max-close=%.1f max-reverse=%.1f",
+                     coldOpenMilliseconds ?? 0, maxWarmOpenMilliseconds, maxCloseMilliseconds, maxReverseMilliseconds))
+        print(String(format: "%@: preview-toggle summary checks=%d failures=%d reversals=%d reduceMotion=%@ max-space-dispatch-ms=%.1f",
+                     failures == 0 ? "PASS" : "FAIL", checks, failures, reversals, String(reducedMotion), maxDispatchMilliseconds))
         fflush(stdout)
         NSApp.terminate(nil)
     }
@@ -547,17 +614,23 @@ func runPreviewToggleTests(controller: Controller) async {
     NSApp.setActivationPolicy(.regular)
     NSApp.activate()
     await pause(100)
+    await checkShelfReopen()
 
     for interval: UInt64 in [30, 60, 100] {
         for count in [3, 4, 5] {
             await reset("\(count)-press-\(interval)ms")
             for index in 0..<count {
                 if index > 0 { await pause(interval) }
-                tap()
-                if index == 1 { observeClose() }
+                toggleAndCheck(open: index % 2 == 0)
             }
             await settle(count % 2 == 1)
         }
+    }
+
+    if !reducedMotion {
+        await reverseOpen("main-queue-stall-during-reversal")
+        DispatchQueue.main.async { Thread.sleep(forTimeInterval: 0.19) }
+        await settle(true)
     }
 
     await reset("held-space-opens-once")
@@ -565,54 +638,67 @@ func runPreviewToggleTests(controller: Controller) async {
     for _ in 0..<4 { await pause(30); send(.keyDown, repeating: true) }
     verifyOpen(true, "repeat keyDown does not close opened preview")
     send(.keyUp)
-    tap()
-    observeClose()
+    toggleAndCheck(open: false)
     await settle(false)
 
     await reset("held-space-closes-once")
-    tap()
+    toggleAndCheck(open: true)
     send(.keyDown)
-    observeClose()
     for _ in 0..<4 { await pause(30); send(.keyDown, repeating: true) }
     send(.keyUp)
     await settle(false)
-    tap()
+    toggleAndCheck(open: true)
     await settle(true)
 
-    await pendingOpen("pending-open-escape")
+    if !reducedMotion {
+        await reset("reverse-visible-fade")
+        toggleAndCheck(open: true)
+        await waitUntil { controller.previewWindow?.alphaValue == 1 }
+        toggleAndCheck(open: false)
+        await waitUntil { (controller.previewWindow?.alphaValue ?? 0) < 1 }
+        let fadingOpacity = controller.previewWindow?.alphaValue ?? 0
+        check(fadingOpacity > 0 && fadingOpacity < 1, "the preview actually fades before reversing")
+        toggleAndCheck(open: true)
+        check(controller.previewWindow?.alphaValue == fadingOpacity, "reversal starts at current opacity")
+        await waitUntil { (controller.previewWindow?.alphaValue ?? 0) > fadingOpacity }
+        check((controller.previewWindow?.alphaValue ?? 0) > fadingOpacity, "reversal raises opacity before settlement")
+        await settle(true)
+    }
+
+    await reverseOpen("escape-during-reverse")
     tap(53, "\u{1b}")
     await settle(false)
-    check(panel.isVisible && panel.isKeyWindow, "escape cancels pending open without hiding shelf")
+    check(panel.isVisible && panel.isKeyWindow, "escape closes reversed preview without hiding shelf")
 
-    await pendingOpen("pending-open-settings")
+    await reverseOpen("settings-during-reverse")
     controller.openSettings()
     await settle(false)
     check(store.settings && controller.settingsWindow?.isKeyWindow == true && !panel.isVisible,
           "late callbacks preserve settings focus")
 
-    await pendingOpen("pending-open-hide")
+    await reverseOpen("hide-during-reverse")
     controller.hideShelf()
     await settle(false)
     check(!panel.isVisible, "late callbacks leave shelf hidden")
 
-    await pendingOpen("pending-open-editor")
+    await reset("editor-during-close")
+    toggleAndCheck(open: true)
+    toggleAndCheck(open: false)
     if let clip = store.filtered.first {
         controller.edit(clip)
         await settle(false)
         check(controller.editorWindow?.isKeyWindow == true, "late callbacks preserve editor focus")
     } else { check(false, "isolated edit fixture exists") }
 
-    await reset("closing-arrow-pending-open")
+    await reset("closing-arrow-reversal")
     let ids = store.filtered.prefix(2).map(\.id)
     guard ids.count == 2 else { check(false, "two isolated selection fixtures exist"); return }
-    tap()
-    tap()
-    observeClose()
+    toggleAndCheck(open: true)
+    toggleAndCheck(open: false)
     tap(124, "\u{F703}")
-    tap()
+    toggleAndCheck(open: true)
     await settle(true)
     check(store.selected == ids[1] && controller.previewClipID == ids[1],
-          "pending open follows latest arrow selection")
-    print("Preview-toggle native close observations: asynchronous=\(closingObservations) synchronous=\(synchronousCloses)")
-    check(closingObservations > 0, "native animated close exposes the pending-input path")
+          "reversal follows latest arrow selection")
+    if !reducedMotion { check(reversals > 0, "rapid input exercises in-place reversal") }
 }

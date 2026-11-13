@@ -6,6 +6,15 @@ import Quartz
 import UniformTypeIdentifiers
 import ImageIO
 
+enum ShelfLayout {
+    static let defaultHeight: CGFloat = 360
+    static let horizontalInset: CGFloat = 32
+    static let cardSpacing: CGFloat = 16
+    static let verticalInset: CGFloat = 12
+
+    static func cardWidth(compact: Bool) -> CGFloat { compact ? 180 : 240 }
+}
+
 struct CapturedColor {
     let hex: String
     var nsColor: NSColor { let n = UInt32(hex.dropFirst(), radix: 16) ?? 0; return NSColor(srgbRed: Double((n >> 16) & 255) / 255, green: Double((n >> 8) & 255) / 255, blue: Double(n & 255) / 255, alpha: 1) }
@@ -218,20 +227,26 @@ extension Controller {
         window.title = title; window.level = NSWindow.Level(rawValue: panel.level.rawValue + 1); window.isReleasedWhenClosed = false; window.center(); window.delegate = self; return window
     }
     func showPreview(_ clip: Clip) {
+        let finishTiming = AcceptanceMetrics.begin("preview.open"); defer { finishTiming() }
         closePreview(animated: false)
         let popover = NSPopover()
         popover.behavior = .applicationDefined
-        popover.animates = true
+        popover.animates = false
         popover.delegate = self
         let host = NSHostingController(rootView: FullItemPreview(store: store, id: clip.id))
         host.sizingOptions = []
         popover.contentViewController = host
-        popover.contentSize = previewSize(for: clip.id)
+        popover.contentSize = previewSize(for: clip)
         previewPopover = popover; previewHost = host; previewClipID = clip.id
         if let anchor = previewAnchor(for: clip.id) {
             popover.show(relativeTo: anchor.rect, of: anchor.view, preferredEdge: anchor.edge)
         } else if let content = panel.contentView {
             popover.show(relativeTo: NSRect(x: content.bounds.midX, y: content.bounds.midY, width: 1, height: 1), of: content, preferredEdge: .maxY)
+        }
+        guard let window = previewWindow else { finishPreviewClose(popover); return }
+        if !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            window.alphaValue = 0.25
+            fadePreview(window, to: 1)
         }
         previewSelectionObserver = store.$selected.dropFirst().receive(on: DispatchQueue.main).sink { [weak self, weak popover] id in
             guard let self, let popover, popover === self.previewPopover, !self.previewClosing,
@@ -240,15 +255,61 @@ extension Controller {
         }
     }
     func closePreview(animated: Bool = true) {
-        previewReopenRequested = false
-        guard let popover = previewPopover, !animated || !previewClosing else { return }
-        previewSelectionObserver = nil
-        if popover.isShown {
+        guard let popover = previewPopover else { return }
+        let finishTiming = AcceptanceMetrics.begin("preview.close"); defer { finishTiming() }
+        if animated, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion, let window = previewWindow {
+            guard !previewClosing else { return }
             previewClosing = true
-            popover.animates = animated
-            popover.close()
-            if animated { return }
+            fadePreview(window, to: 0)
+        } else {
+            dismissPreview(popover)
         }
+    }
+    func reopenPreview() {
+        guard previewClosing, let window = previewWindow, panel.isVisible, NSApp.isActive,
+              !store.settings, !interactionState.hasModalInteraction, !interactionState.menuTracking,
+              editorWindow?.isVisible != true, let clip = store.selectedClips.first else { return }
+        let finishTiming = AcceptanceMetrics.begin("preview.reverse"); defer { finishTiming() }
+        previewClosing = false
+        fadePreview(window, to: 1)
+        if previewClipID != clip.id { updatePreview(to: clip.id) }
+    }
+    private func cancelPreviewFade() {
+        previewFadeGeneration += 1
+        previewFadeTimer?.cancel()
+        previewFadeTimer = nil
+    }
+    private func fadePreview(_ window: NSWindow, to target: CGFloat) {
+        // Keep the popover alive until it is invisible so a new toggle can reverse from its current opacity.
+        cancelPreviewFade()
+        let generation = previewFadeGeneration
+        let initial = window.alphaValue
+        let duration = 0.10
+        if initial == target || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            window.alphaValue = target
+            if target == 0, let popover = previewPopover { dismissPreview(popover) }
+            return
+        }
+        let start = ProcessInfo.processInfo.systemUptime
+        let frameInterval = DispatchTimeInterval.nanoseconds(1_000_000_000 / 60)
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + frameInterval, repeating: frameInterval, leeway: .milliseconds(1))
+        timer.setEventHandler { [weak self, weak window] in
+            guard let self, self.previewFadeGeneration == generation else { return }
+            guard let window, self.previewWindow === window else { self.cancelPreviewFade(); return }
+            let fraction = CGFloat(min(1, (ProcessInfo.processInfo.systemUptime - start) / duration))
+            let eased = fraction * fraction * (3 - 2 * fraction)
+            window.alphaValue = initial + (target - initial) * eased
+            if fraction == 1 {
+                self.cancelPreviewFade()
+                if target == 0, let popover = self.previewPopover { self.dismissPreview(popover) }
+            }
+        }
+        previewFadeTimer = timer
+        timer.activate()
+    }
+    private func dismissPreview(_ popover: NSPopover) {
+        if popover.isShown { popover.close() }
         finishPreviewClose(popover)
     }
     func popoverDidClose(_ notification: Notification) {
@@ -257,26 +318,18 @@ extension Controller {
     }
     private func finishPreviewClose(_ popover: NSPopover) {
         guard popover === previewPopover else { return }
-        let reopen = previewReopenRequested
-        previewReopenRequested = false
+        cancelPreviewFade()
         previewSelectionObserver = nil
         previewPopover = nil; previewHost = nil; previewClipID = nil
         previewClosing = false
-        // Consume the final toggle before another key event can see an intermediate closed state.
-        if reopen, panel.isVisible, NSApp.isActive, !store.settings,
-           !interactionState.hasModalInteraction, !interactionState.menuTracking,
-           editorWindow?.isVisible != true, let clip = store.selectedClips.first {
-            showPreview(clip)
-            return
-        }
         DispatchQueue.main.async { [weak self] in
             guard let self, self.previewPopover == nil else { return }
             self.restoreWorkingWindowFocus()
         }
     }
-    private func previewSize(for id: UUID) -> NSSize {
+    private func previewSize(for clip: Clip?) -> NSSize {
         let screen = (panel.screen ?? NSScreen.main ?? NSScreen.screens[0]).visibleFrame.size
-        let size = PreviewLayout.size(for: store.archive.clips.first { $0.id == id }, screen: screen)
+        let size = PreviewLayout.size(for: clip, screen: screen)
         return NSSize(width: size.width, height: size.height)
     }
     /// Swaps the previewed card in place and moves the popover's arrow to it.
@@ -284,7 +337,7 @@ extension Controller {
         guard let popover = previewPopover, let host = previewHost else { return }
         previewClipID = id
         host.rootView = FullItemPreview(store: store, id: id)
-        popover.contentSize = previewSize(for: id)
+        popover.contentSize = previewSize(for: store.archive.clips.first { $0.id == id })
         reanchorPreview(to: id)
         // The shelf scrolls the new card into view asynchronously; anchor again once it has.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak popover] in
@@ -301,9 +354,10 @@ extension Controller {
     func previewAnchor(for id: UUID) -> (view: NSView, rect: NSRect, edge: NSRectEdge)? {
         guard panel.isVisible, let content = panel.contentView, let index = store.visibleIndex(of: id),
               let scroll = firstScrollView(in: content), let document = scroll.documentView else { return nil }
-        let width: CGFloat = store.compact ? 180 : 240
+        let width = ShelfLayout.cardWidth(compact: store.compact)
         let slot = index + (store.translating ? 1 : 0)
-        let rect = NSRect(x: 20 + CGFloat(slot) * (width + 12), y: 8, width: width, height: max(40, document.bounds.height - 16))
+        let rect = NSRect(x: ShelfLayout.horizontalInset + CGFloat(slot) * (width + ShelfLayout.cardSpacing), y: ShelfLayout.verticalInset,
+                          width: width, height: max(40, document.bounds.height - 2 * ShelfLayout.verticalInset))
         return (document, rect, document.isFlipped ? .minY : .maxY)
     }
     private func firstScrollView(in view: NSView) -> NSScrollView? {
@@ -386,7 +440,14 @@ extension Controller {
             }
         }
     }
-    func createText() { var clip = Clip(source: "OpenPaste", sourceID: Bundle.main.bundleIdentifier ?? "", kind: "文字", title: "新建文字", text: "", parts: []); clip.parts = [[ClipPart(type: "public.utf8-plain-text", data: Data())]]; edit(clip) }
+    func createText() {
+        let bundle = Bundle.main
+        let source = bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+            ?? bundle.object(forInfoDictionaryKey: "CFBundleName") as? String ?? "GuziPaste"
+        let clip = Clip(source: source, sourceID: bundle.bundleIdentifier ?? "", kind: "文字", title: "新建文字", text: "",
+                        parts: [[ClipPart(type: "public.utf8-plain-text", data: Data())]])
+        edit(clip)
+    }
     func rotate(_ clip: Clip) {
         let expectedFingerprint = clip.fingerprint
         store.captureQueue.async { [weak self] in

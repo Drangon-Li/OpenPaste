@@ -29,7 +29,7 @@ struct SettingsView: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 24) {
-                HStack(spacing: 9) { Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 32, height: 32); VStack(alignment: .leading, spacing: 2) { Text("OpenPaste").font(.system(size: 15, weight: .semibold)); Text("本机剪贴板").font(.system(size: 11)).foregroundStyle(.secondary) } }.padding(.top, 8)
+                HStack(spacing: 9) { Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 32, height: 32); VStack(alignment: .leading, spacing: 2) { Text("GuziPaste").font(.system(size: 15, weight: .semibold)); Text("本机剪贴板").font(.system(size: 11)).foregroundStyle(.secondary) } }.padding(.top, 8)
                 VStack(spacing: 5) {
                     ForEach(SettingsPage.allCases, id: \.self) { item in
                         Button { Controller.shared.cancelShortcutRecording(); page = item } label: {
@@ -42,7 +42,7 @@ struct SettingsView: View {
                 Spacer()
                 VStack(alignment: .leading, spacing: 7) { Label(directory.isCloud ? "iCloud Drive 同步" : "本机数据目录", systemImage: directory.isCloud ? "icloud" : "internaldrive"); Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "OpenPasteReleaseVersion") as? String ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")") }.font(.system(size: 11)).foregroundStyle(.secondary)
                 Button { Controller.shared.quit() } label: {
-                    Label("退出 OpenPaste", systemImage: "power").frame(maxWidth: .infinity, alignment: .leading)
+                    Label("退出 GuziPaste", systemImage: "power").frame(maxWidth: .infinity, alignment: .leading)
                 }.buttonStyle(.bordered).controlSize(.small).help("退出程序并保存历史记录")
             }.padding(16).frame(width: 170).background(.regularMaterial)
             Divider()
@@ -119,6 +119,7 @@ struct SettingsPageView: View {
     @ObservedObject private var updates = UpdateChecker.shared
     @ObservedObject private var installer = UpdateInstaller.shared
     @ObservedObject private var analytics = UsageAnalytics.shared
+    @ObservedObject private var login = LaunchAtLogin.shared
     @State private var translationKey = ""
     private func group<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -132,7 +133,7 @@ struct SettingsPageView: View {
     var body: some View {
         VStack(spacing: 0) {
                 HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 6) { Text(page == .about ? "关于 OpenPaste" : page.rawValue).font(.system(size: 23, weight: .semibold)); Text(page.subtitle).font(.system(size: 12)).foregroundStyle(.secondary) }
+                    VStack(alignment: .leading, spacing: 6) { Text(page == .about ? "关于 GuziPaste" : page.rawValue).font(.system(size: 23, weight: .semibold)); Text(page.subtitle).font(.system(size: 12)).foregroundStyle(.secondary) }
                     Spacer()
                 }.padding(24)
                 ScrollView {
@@ -141,7 +142,7 @@ struct SettingsPageView: View {
                         case .general: general
                         case .translation:
                             group("翻译服务") { TranslationSettings(store: store, key: $translationKey) }
-                            HStack(alignment: .top, spacing: 9) { Image(systemName: "info.circle").foregroundStyle(.secondary); note("使用 OpenAI 兼容接口。开启后，选中文字会发送到你配置的服务；OpenPaste 不上传其他历史。") }
+                            HStack(alignment: .top, spacing: 9) { Image(systemName: "info.circle").foregroundStyle(.secondary); note("使用 OpenAI 兼容接口。开启后，选中文字会发送到你配置的服务；GuziPaste 不上传其他历史。") }
                         case .privacy: privacy
                         case .data: data
                         case .about: about
@@ -154,13 +155,13 @@ struct SettingsPageView: View {
         VStack(alignment: .leading, spacing: 22) {
             VStack(spacing: 12) {
                 Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 72, height: 72)
-                Text("OpenPaste").font(.system(size: 26, weight: .semibold))
+                Text("GuziPaste").font(.system(size: 26, weight: .semibold))
                 Text("让复制过的内容，随时可用。") .font(.system(size: 13)).foregroundStyle(.secondary)
                 Text("版本 \(Bundle.main.object(forInfoDictionaryKey: "OpenPasteReleaseVersion") as? String ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")").font(.system(size: 11)).foregroundStyle(.tertiary)
             }.padding(.vertical, 24).frame(maxWidth: .infinity).background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
             group("软件更新") {
                 Toggle("自动检查更新", isOn: $updates.automatic).toggleStyle(.switch)
-                note("开启后每天检查一次 GitHub Release，仅查询公开版本信息，不上传剪贴板内容。")
+                note("开启后每次启动检查 GuziPaste 新版本，持续运行时每天检查一次。发现新版后可选择更新或跳过。")
                 Toggle("包含预发布版本", isOn: $updates.includePrerelease).toggleStyle(.switch)
                 note("默认只发现正式版。开启后也会发现 rc 等预发布版本，它们可能不稳定。")
                 HStack {
@@ -200,7 +201,7 @@ struct SettingsPageView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 if analytics.available {
-                    note("官方构建默认开启。OpenPaste 向 Google Firebase Analytics 记录首次启动、粘贴取用和翻译成功三项次数；首次启动用于估算安装量。Firebase SDK 还会处理应用实例标识、设备与应用版本等基础信息。")
+                    note("官方构建默认开启。GuziPaste 向 Google Firebase Analytics 记录首次启动、粘贴取用和翻译成功三项次数；首次启动用于估算安装量。Firebase SDK 还会处理应用实例标识、设备与应用版本等基础信息。")
                     note("不发送剪贴板内容、所选文字、网址、文件路径或翻译 API Key。可在「隐私与权限」关闭，关闭后停止收集并清除本机统计标识。")
                     Button("管理使用统计…") { NotificationCenter.default.post(name: SettingsView.privacyNotification, object: nil) }.buttonStyle(.link)
                 } else {
@@ -239,6 +240,19 @@ struct SettingsPageView: View {
     }
     private var general: some View {
         VStack(alignment: .leading, spacing: 22) {
+            group("启动") {
+                Toggle("登录 Mac 时启动 GuziPaste", isOn: Binding(get: { login.enabled }, set: { login.setEnabled($0) }))
+                    .toggleStyle(.switch).disabled(login.changing || !login.available)
+                note("登录后在菜单栏运行。开启自动检查更新后，启动时会检查新版本。")
+                if login.status == .requiresApproval {
+                    note("请在系统的登录项设置中允许 GuziPaste 启动。")
+                    Button("打开登录项设置…") { login.openSystemSettings() }
+                }
+                if !login.available { note("隔离验收模式不登记系统登录项。") }
+                if !login.message.isEmpty { note(login.message) }
+            }
+            .onAppear { login.refresh() }
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in login.refresh() }
             group("键盘操作") {
                 HStack { Text("呼出剪贴板"); Spacer(); Text(store.recordingShortcut ? "请按组合键…" : store.shortcutLabel).font(.system(size: 12, weight: .medium, design: .monospaced)).padding(.horizontal, 10).padding(.vertical, 6).background(.quaternary, in: RoundedRectangle(cornerRadius: 6)); Button(store.recordingShortcut ? "取消" : "更改…") { Controller.shared.beginShortcutRecording() } }
                 HStack { note(store.shortcutNotice.isEmpty ? "使用 ⌘、⌃ 或 ⌥ 搭配一个按键，也可组合 ⇧。录制时按 Esc 取消。" : store.shortcutNotice); Spacer(); Button("恢复默认") { Controller.shared.cancelShortcutRecording(); Controller.shared.installShortcut(.standard, persist: true) }.buttonStyle(.link).font(.caption) }
@@ -272,6 +286,13 @@ struct SettingsPageView: View {
                 note("收藏内容不受条数与时间限制。当前容量上限 \(store.storageLimitMB) MB；单条超过 20 MB 时跳过。")
             }
             group("内容预览") {
+                HStack {
+                    Text("面板高度")
+                    Spacer()
+                    Button("恢复默认高度") { Controller.shared.resizeShelf(ShelfLayout.defaultHeight) }
+                }
+                note("默认高度 360 点，也可拖动面板顶部调整。")
+                Divider()
                 HStack { Text("加载网页与地图预览"); Spacer(); Toggle("加载网页与地图预览", isOn: $store.networkPreviews).labelsHidden().toggleStyle(.switch) }
                 note("访问对应网页与 Apple 地图以获取预览。内网地址及疑似验证链接需在卡片上点击加载；关闭后不再发起新的预览请求。")
                 Divider()
@@ -286,7 +307,7 @@ struct SettingsPageView: View {
                 HStack { Text("按回车直接粘贴"); Spacer(); Toggle("按回车直接粘贴", isOn: $store.pasteOnReturn).labelsHidden().toggleStyle(.switch) }
                 note("开启且系统已授权时，按回车会粘贴到原输入框。关闭或未授权时，按回车只复制，可手动按 ⌘V 粘贴。")
                 Button("打开辅助功能设置…") { Controller.shared.requestAccessibility() }
-                if !store.directPasteAuthorized { note("如果系统辅助功能授权已开启，退出并重新打开 OpenPaste。若仍未生效，请移除旧条目，重新添加当前运行的 OpenPaste.app。") }
+                if !store.directPasteAuthorized { note("如果系统辅助功能授权已开启，退出并重新打开 GuziPaste。若仍未生效，请移除旧条目，重新添加当前运行的 GuziPaste.app。") }
             }
             group("排除应用") {
                 note("这些应用的复制内容不会记录，也不会执行快速翻译。每行填写一个 Bundle ID。")
@@ -295,9 +316,9 @@ struct SettingsPageView: View {
             }
             group("记录控制") { HStack { Text(store.recordingPauseControl.status); Spacer(); Button(store.recordingPauseControl.buttonTitle) { Controller.shared.togglePause() }.disabled(store.recordingPauseControl.action == .unavailable) }; note("普通文字中的密码无法可靠识别，请使用排除应用或暂停记录。历史由 macOS 账户权限和磁盘保护，未单独加密。") }
             group("匿名使用统计") {
-                HStack { Text("帮助改进 OpenPaste"); Spacer(); Toggle("帮助改进 OpenPaste", isOn: $analytics.enabled).labelsHidden().toggleStyle(.switch).disabled(!analytics.available) }
+                HStack { Text("帮助改进 GuziPaste"); Spacer(); Toggle("帮助改进 GuziPaste", isOn: $analytics.enabled).labelsHidden().toggleStyle(.switch).disabled(!analytics.available) }
                 if analytics.available {
-                    note("默认开启。OpenPaste 向 Google Firebase Analytics 记录首次启动、粘贴取用和翻译成功三项次数；首次启动用于估算安装量。SDK 还会处理应用实例标识、设备与应用版本等基础信息。不会发送剪贴板内容、所选文字、网址、文件路径或翻译 API Key。关闭后停止收集并清除本机统计标识。")
+                    note("默认开启。GuziPaste 向 Google Firebase Analytics 记录首次启动、粘贴取用和翻译成功三项次数；首次启动用于估算安装量。SDK 还会处理应用实例标识、设备与应用版本等基础信息。不会发送剪贴板内容、所选文字、网址、文件路径或翻译 API Key。关闭后停止收集并清除本机统计标识。")
                 } else {
                     note("此构建未配置 Firebase，使用统计不可用。历史和剪贴板功能不受影响。")
                 }
@@ -306,6 +327,19 @@ struct SettingsPageView: View {
     }
     private var data: some View {
         VStack(alignment: .leading, spacing: 22) {
+            group("iCloud Drive 同步") {
+                Label(store.isICloudDirectory ? "已选择 iCloud Drive 数据目录" : "当前使用本机目录", systemImage: store.isICloudDirectory ? "icloud" : "internaldrive")
+                note("在各台 Mac 上选择 iCloud Drive 中的同一专用文件夹，可合并历史、收藏和图片。上传与下载由 macOS 完成。")
+                HStack {
+                    Button(store.isICloudDirectory ? "选择其他 iCloud 文件夹…" : "启用 iCloud Drive 同步…") { store.chooseICloudDirectory() }
+                    if store.isICloudDirectory {
+                        Button(store.directorySyncInProgress ? "正在检查…" : "检查 / 重试同步") { store.retryDirectorySync() }
+                            .disabled(store.directorySyncInProgress)
+                    }
+                }
+                if !store.directorySyncStatus.isEmpty { note(store.directorySyncStatus) }
+                if store.isICloudDirectory { Button("改回本机保存") { store.changeDataDirectory(to: DataDirectory.defaultRoot) } }
+            }
             group("数据保存目录") {
                 HStack { Label(directory.isCloud ? "iCloud Drive" : (store.root.standardizedFileURL.path == DataDirectory.defaultRoot.standardizedFileURL.path ? "本机默认目录" : "自定义目录"), systemImage: directory.isCloud ? "icloud" : "folder"); Spacer(); Button("打开目录") { Controller.shared.openExternal(store.root) } }
                 Text(store.root.path).font(.system(size: 11, design: .monospaced)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true).foregroundStyle(.secondary)

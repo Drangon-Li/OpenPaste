@@ -39,7 +39,7 @@ private func menuBarMark() -> NSImage {
         return true
     }
     image.isTemplate = true
-    image.accessibilityDescription = "OpenPaste"
+    image.accessibilityDescription = "GuziPaste"
     return image
 }
 
@@ -49,11 +49,14 @@ final class ShelfPanel: NSPanel { override var canBecomeKey: Bool { true }; over
 final class ShelfHost: NSHostingView<ShelfView> { override var acceptsFirstResponder: Bool { true } }
 final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPopoverDelegate {
     static var shared: Controller!
+    static let shelfShownNotification = Notification.Name("GuziPasteShelfShown")
     let preview = TestMode.translationWorkflow || TestMode.translationUI || TestMode.featureUI || TestMode.preview || TestMode.layout || TestMode.shortcut || TestMode.ui || TestMode.keyboard
     lazy var store = Store(ephemeral: preview, loadHistoryAsynchronously: !preview && !TestMode.active)
     var panel: ShelfPanel!
     var status: NSStatusItem!
     var updateMenuItem: NSMenuItem?
+    var pendingLaunchUpdate: GitHubRelease?
+    var presentedUpdateTags = Set<String>()
     var target: NSRunningApplication?
     var hotkey: EventHotKeyRef?
     var shortcut = GlobalShortcut.load()
@@ -74,7 +77,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     /// The preview is a system popover anchored to the selected card.
     var previewPopover: NSPopover?
     var previewClosing = false
-    var previewReopenRequested = false
+    var previewFadeTimer: DispatchSourceTimer?
+    var previewFadeGeneration = 0
     var previewHost: NSHostingController<FullItemPreview>?
     var previewSelectionObserver: AnyCancellable?
     var previewWindow: NSWindow? { previewPopover?.isShown == true ? previewHost?.view.window : nil }
@@ -158,7 +162,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         finishStoreInit()
         restoreRecordingPause()
         if !preview && !TestMode.active && AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { UsageAnalytics.shared.start() }
-        if let iconURL = Bundle.main.url(forResource: "OpenPaste-v2", withExtension: "icns"), let icon = NSImage(contentsOf: iconURL) { NSApp.applicationIconImage = icon }
+        if let iconURL = Bundle.main.url(forResource: "GuziPaste", withExtension: "icns"), let icon = NSImage(contentsOf: iconURL) { NSApp.applicationIconImage = icon }
         let finishStoreSetup = AcceptanceMetrics.begin("launch.link-cache")
         LinkPreviewCache.shared.enabled = store.networkPreviews
         finishStoreSetup()
@@ -177,9 +181,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             terminationSignals.append(source)
         }
         NSApp.setActivationPolicy(.accessory)
-        let main = NSMenu(); let appMenu = NSMenu(); let top = NSMenuItem(); top.submenu = appMenu; main.addItem(top)
+        let main = NSMenu(); let appMenu = NSMenu(title: "GuziPaste"); let top = NSMenuItem(); top.submenu = appMenu; main.addItem(top)
         let settingsItem = NSMenuItem(title: "设置…", action: #selector(openSettingsFromMenu), keyEquivalent: ","); settingsItem.target = self; appMenu.addItem(settingsItem); appMenu.addItem(.separator())
-        let quitItem = NSMenuItem(title: "退出 OpenPaste", action: #selector(quit), keyEquivalent: "q"); quitItem.target = self; appMenu.addItem(quitItem); let editMenu = NSMenu(title: "编辑")
+        let quitItem = NSMenuItem(title: "退出 GuziPaste", action: #selector(quit), keyEquivalent: "q"); quitItem.target = self; appMenu.addItem(quitItem); let editMenu = NSMenu(title: "编辑")
         let editItem = NSMenuItem(title: "编辑", action: nil, keyEquivalent: ""); editItem.submenu = editMenu; main.addItem(editItem)
         for (title, action, key) in [("撤销", "undo:", "z"), ("剪切", "cut:", "x"), ("复制", "copy:", "c"), ("粘贴", "paste:", "v"), ("全选", "selectAll:", "a")] {
             editMenu.addItem(withTitle: title, action: Selector(action), keyEquivalent: key)
@@ -208,7 +212,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         #endif
         let finishPanelHost = AcceptanceMetrics.begin("launch.panel-host")
         let finishPanelWindow = AcceptanceMetrics.begin("launch.panel-window")
-        panel = ShelfPanel(contentRect: NSRect(x: 0, y: 0, width: 1100, height: max(180, AppEnvironment.current.defaults.double(forKey: "shelfHeight") == 0 ? 300 : AppEnvironment.current.defaults.double(forKey: "shelfHeight"))), styleMask: [.borderless, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel = ShelfPanel(contentRect: NSRect(x: 0, y: 0, width: 1100, height: max(180, AppEnvironment.current.defaults.double(forKey: "shelfHeight") == 0 ? Double(ShelfLayout.defaultHeight) : AppEnvironment.current.defaults.double(forKey: "shelfHeight"))), styleMask: [.borderless, .resizable, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.becomesKeyOnlyIfNeeded = false; panel.hidesOnDeactivate = false
         panel.delegate = self
         panel.level = .statusBar; panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
@@ -243,11 +247,15 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         menu.addItem(updateItem); updateMenuItem = updateItem
         UpdateChecker.shared.onChange = { [weak self] in self?.updateMenuItem?.title = UpdateChecker.shared.menuTitle }
         if !preview {
+            UpdateChecker.shared.onLaunchUpdateAvailable = { [weak self] release in
+                self?.pendingLaunchUpdate = release
+                self?.presentLaunchUpdateWhenReady()
+            }
             UpdateChecker.shared.start(); UpdateInstaller.shared.sweepStaleStaging()
             // Let the menu bar and windows settle before telling the user how the last update went.
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.showUpdateResultIfNeeded() }
         }
-        menu.addItem(withTitle: "退出 OpenPaste", action: #selector(quit), keyEquivalent: "q")
+        menu.addItem(withTitle: "退出 GuziPaste", action: #selector(quit), keyEquivalent: "q")
         for item in menu.items { item.target = self }; status.menu = menu
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in Controller.shared?.hotkeyFired(eventTime: event.map { GetEventTime($0) }); return noErr }, 1, &spec, nil, &handler)
@@ -283,7 +291,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                event.window === self.panel || event.window === self.previewHost?.view.window,
                event.keyCode == 49 || event.keyCode == 53 {
                 if !event.isARepeat {
-                    if event.keyCode == 49 { self.previewReopenRequested.toggle() }
+                    if event.keyCode == 49 { self.reopenPreview() }
                     else { self.closePreview() }
                 }
                 return nil
@@ -491,12 +499,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         let sourceApp = resolveExternalTarget()
         let initialSource = sourceApp.map { ClipboardCaptureSource(name: $0.localizedName ?? "未知应用", bundleID: $0.bundleIdentifier ?? "") }
         let initialChangeCount = NSPasteboard.general.changeCount
-        let alert = NSAlert(); alert.messageText = "欢迎使用 OpenPaste"
+        let alert = NSAlert(); alert.messageText = "欢迎使用 GuziPaste"
         alert.informativeText = "启用后，当前剪贴板以及之后复制的文字、链接、图片和文件引用都会保存到这台 Mac。默认跳过已标记的敏感内容和常见密码管理器。普通应用复制的敏感文字仍可能被记录，请按需要暂停或设置排除应用。\n\n默认保存在本机；可在数据管理中选择 iCloud Drive 目录，由系统同步历史。网页预览与快速翻译按各自的设置联网。"
         if UsageAnalytics.shared.available {
             alert.informativeText += "\n\n使用统计默认开启：向 Google Firebase Analytics 发送首次启动、粘贴取用和翻译成功次数，以及 SDK 的应用实例、设备和版本信息，不包含剪贴板正文或翻译密钥。可单独关闭，不影响本地记录。"
             alert.showsSuppressionButton = true
-            alert.suppressionButton?.title = "帮助改进 OpenPaste（发送使用统计）"
+            alert.suppressionButton?.title = "帮助改进 GuziPaste（发送使用统计）"
             alert.suppressionButton?.state = UsageAnalytics.shared.enabled ? .on : .off
         }
         alert.addButton(withTitle: "启用本地记录"); alert.addButton(withTitle: "暂不启用")
@@ -552,6 +560,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         panel.setFrame(NSRect(x: r.minX, y: r.minY, width: r.width, height: h), display: !activating)
         store.reverseHistory = false; store.selection.removeAll(); store.compact = h < 270
         store.selected = store.currentClipID ?? store.filtered.first?.id
+        let presentation = shelfPresentation
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.panel.isVisible, self.shelfPresentation == presentation else { return }
+            NotificationCenter.default.post(name: Self.shelfShownNotification, object: nil)
+        }
         if activating {
             shelfAwaitingActivation = false
             NSApp.activate(); panel.makeKeyAndOrderFront(nil)
@@ -717,7 +730,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             let screen = panel.screen ?? NSScreen.main!
             let height = min(620, max(260, screen.visibleFrame.height - 100))
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: min(760, screen.visibleFrame.width - 60), height: height), styleMask: [.titled, .closable], backing: .buffered, defer: false)
-            window.title = "OpenPaste 设置"
+            window.title = "GuziPaste 设置"
             window.isReleasedWhenClosed = false
             window.standardWindowButton(.closeButton)?.isHidden = false
             window.standardWindowButton(.closeButton)?.isEnabled = true
@@ -772,16 +785,34 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
         UpdateChecker.shared.check()
     }
+    func presentLaunchUpdateWhenReady() {
+        guard let release = pendingLaunchUpdate else { return }
+        guard UpdateChecker.shared.automatic, !presentedUpdateTags.contains(release.tag_name), UpdateChecker.shared.available?.tag_name == release.tag_name else {
+            pendingLaunchUpdate = nil
+            return
+        }
+        guard !interactionState.hasModalInteraction, !interactionState.menuTracking,
+              previewPopover == nil, editorWindow?.isVisible != true,
+              !store.importingPaste, !store.changingDataDirectory, !panel.isVisible,
+              !store.recordingShortcut, store.recordingChord == nil else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.presentLaunchUpdateWhenReady() }
+            return
+        }
+        pendingLaunchUpdate = nil
+        showUpdateDetails()
+    }
     func showUpdateDetails() {
         guard !modalShowing, let release = UpdateChecker.shared.available, let url = release.pageURL else { return }
+        pendingLaunchUpdate = nil
+        presentedUpdateTags.insert(release.tag_name)
         openSettings()
         NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
         let installer = UpdateInstaller.shared
         let blocked = installer.blockingReason()
         let alert = NSAlert()
-        alert.messageText = "OpenPaste \(release.version) 已发布"
+        alert.messageText = "GuziPaste \(release.version) 已发布"
         alert.informativeText = blocked == nil
-            ? "选择“下载并更新”后，应用会下载并校验新版，确认后才会重启安装；历史保留，辅助功能授权不变。"
+            ? "选择“下载并更新”后，应用会下载并校验新版，确认后才会重启安装；历史和设置将继续使用。使用相同证书签名的版本可保持应用身份。"
             : "\(blocked?.localizedDescription ?? "")。"
         let notes = NSTextView(frame: NSRect(x: 0, y: 0, width: 430, height: 180))
         notes.string = String((release.body ?? "该版本没有提供更新说明。").prefix(12000))
@@ -799,17 +830,20 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                     installer.prepare(release)
                 } else { self?.openExternal(url) }
             }
-            else if response == .alertThirdButtonReturn { UpdateChecker.shared.skip() }
+            else if response == .alertThirdButtonReturn { UpdateChecker.shared.skip(release) }
         }
     }
     func showUpdateResultIfNeeded() {
+        guard !interactionState.hasModalInteraction, !interactionState.menuTracking else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showUpdateResultIfNeeded() }
+            return
+        }
         guard let notice = UpdateNotice.consumePending() else { return }
-        guard !modalShowing else { return }
         openSettings()
         NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
         let alert = NSAlert()
         if notice.succeeded {
-            alert.messageText = "OpenPaste 已更新到 \(notice.to)"
+            alert.messageText = "GuziPaste 已更新到 \(notice.to)"
             alert.informativeText = "上一个版本是 \(notice.from)。历史与设置保持不变。"
         } else {
             alert.messageText = "更新未完成"
@@ -824,7 +858,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         openSettings()
         NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
         let alert = NSAlert()
-        alert.messageText = "OpenPaste \(release.version) 已准备好"
+        alert.messageText = "GuziPaste \(release.version) 已准备好"
         alert.informativeText = "新版已下载，SHA-256 与签名均已验证。现在重启并安装？重启后会自动重新打开，历史数据保留。"
         alert.addButton(withTitle: "重启并安装")
         alert.addButton(withTitle: "稍后")
@@ -933,7 +967,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func dismissShelfForExternalInteraction(reason: ShelfDismissReason = .outsideClick) {
         guard panel.isVisible, !modalShowing, panel.attachedSheet == nil,
-              previewWindow?.isVisible != true, editorWindow?.isVisible != true, !store.settings else { return }
+              (previewClosing || previewWindow?.isVisible != true), editorWindow?.isVisible != true, !store.settings else { return }
         if interactionState.menuTracking {
             if reason == .outsideClick { pendingOutsideClick = true }
             else { pendingApplicationSwitch = true }
@@ -943,6 +977,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         // Delayed activation/resign notifications must still refer to another app.
         guard reason == .outsideClick || (!NSApp.isActive && externalApplicationActive) else { return }
         logInteraction("shelf.hide", reason: reason.rawValue)
+        closePreview(animated: false)
         cancelTranslation()
         store.reverseHistory = false
         panel.orderOut(nil)
@@ -1113,7 +1148,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         presentAlert(alert) { [weak self] response in if response == .alertFirstButtonReturn { self?.store.addBoard(field.stringValue) } }
     }
     func edit(_ clip: Clip) {
-        previewReopenRequested = false
+        if previewClosing { closePreview(animated: false) }
         if clip.kind == "图片" { showPreview(clip); return }
         if clip.kind == "文件" { showToast("文件不能直接编辑，按 ⌘O 打开原文件"); return }
         let editTarget = store.contentEditTarget(for: clip)
@@ -1237,7 +1272,7 @@ struct ShelfView: View {
         VStack(spacing: 0) {
             Rectangle().fill(Color.clear).frame(height: 6).contentShape(Rectangle())
                 .overlay(Capsule().fill(Color.secondary.opacity(0.25)).frame(width: 36, height: 2))
-                .gesture(DragGesture().onChanged { value in if resizeStart == nil { resizeStart = Controller.shared.panel.frame.height }; Controller.shared.resizeShelf((resizeStart ?? 300) - value.translation.height) }.onEnded { _ in resizeStart = nil })
+                .gesture(DragGesture().onChanged { value in if resizeStart == nil { resizeStart = Controller.shared.panel.frame.height }; Controller.shared.resizeShelf((resizeStart ?? ShelfLayout.defaultHeight) - value.translation.height) }.onEnded { _ in resizeStart = nil })
             HStack(spacing: 12) {
                 Spacer(minLength: 0)
                 if !store.searchExpanded {
@@ -1303,7 +1338,7 @@ struct ShelfView: View {
                     Text("← → 选择 · ↵ 粘贴 · \(store.shelfShortcuts.quickPasteLabel) 快速粘贴")
                     Button("关闭 · Esc") { Controller.shared.hideShelf() }
                 } label: { Image(systemName: "ellipsis").font(.system(size: 16)).foregroundStyle(.secondary) }.menuStyle(.borderlessButton).fixedSize().help("更多")
-            }.padding(.horizontal, 20).padding(.vertical, 12)
+            }.padding(.horizontal, ShelfLayout.horizontalInset).padding(.vertical, 16)
             if store.searchExpanded {
             HStack(spacing: 12) {
                 ForEach(["全部", "文字", "链接", "图片", "文件", "颜色"], id: \.self) { kind in
@@ -1323,7 +1358,7 @@ struct ShelfView: View {
                 Button { store.todayOnly.toggle() } label: { Label("今天", systemImage: "calendar").foregroundStyle(store.todayOnly ? Color.blue : Color.secondary) }.buttonStyle(.plain).font(.system(size: 12))
                 Spacer()
                 Text(store.paused ? store.recordingPauseControl.status : (store.query.isEmpty ? "\(store.filtered.count) 条历史" : "找到 \(store.filtered.count) 条结果")).font(.system(size: 12)).foregroundStyle(store.paused ? .orange : .secondary)
-            }.padding(.horizontal, 20).padding(.vertical, 8)
+            }.padding(.horizontal, ShelfLayout.horizontalInset).padding(.vertical, ShelfLayout.verticalInset)
             }
             if store.searchExpanded && !store.query.isEmpty {
                 HStack(spacing: 8) {
@@ -1339,14 +1374,17 @@ struct ShelfView: View {
             } else {
                 ScrollViewReader { proxy in
                     ScrollView(.horizontal) {
-                        LazyHStack(spacing: 12) {
+                        LazyHStack(spacing: ShelfLayout.cardSpacing) {
                             if store.translating { VStack(spacing: 12) { ProgressView(); Text("正在翻译…"); Text("原文保持不变").font(.caption).foregroundStyle(.secondary) }.frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity).background(.quaternary, in: RoundedRectangle(cornerRadius: 12)) }
                             ForEach(renderedClips) { clip in
                                 ClipCard(clip: clip, index: store.visibleIndex(of: clip.id) ?? 0, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, renaming: store.renamingID == clip.id, compact: store.compact, networkPreviews: store.networkPreviews, boards: store.archive.boards, store: store).equatable().id(clip.id)
                                     .onAppear { if clip.id == renderedClips.last?.id { growRenderWindow() } }
                             }
-                        }.padding(.horizontal, 20).padding(.vertical, 8)
+                        }.padding(.horizontal, ShelfLayout.horizontalInset).padding(.vertical, ShelfLayout.verticalInset).id("shelf-content")
                     }.onChange(of: store.selected) { _, id in if let id { revealAndScroll(to: id, proxy: proxy) } }
+                    .onReceive(NotificationCenter.default.publisher(for: Controller.shelfShownNotification)) { _ in
+                        if let id = store.selected { revealAndScroll(to: id, proxy: proxy) }
+                    }
                 }
             }
             if !store.translationStatus.isEmpty { Text(store.translationStatus).font(.system(size: 11)).foregroundStyle(.secondary).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 20).padding(.bottom, 6) }
@@ -1411,6 +1449,7 @@ struct ShelfView: View {
     }
     func revealAndScroll(to id: UUID, proxy: ScrollViewProxy) {
         guard let index = store.visibleIndex(of: id) else { return }
+        if index == 0, !store.translating { proxy.scrollTo("shelf-content", anchor: .leading); return }
         let required = ShelfRenderWindow.countIncluding(index: index, total: store.filtered.count)
         if required > renderedClipCount {
             renderedClipCount = required

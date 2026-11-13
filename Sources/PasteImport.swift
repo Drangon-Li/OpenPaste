@@ -289,7 +289,7 @@ extension Store {
         persistStorageLimitPreference()
         if limit != 0 { limit = max(limit, merged.clips.filter { $0.boards.isEmpty }.count) }
         archive = merged
-        if DataDirectory.usesSync(root) { save() }
+        if usesSharedDirectory { save() }
     }
     @discardableResult func applyPasteImport(_ result: PasteImportResult) throws -> Int {
         guard canModifyHistory else { throw PasteImport.failure(historyModificationNotice) }

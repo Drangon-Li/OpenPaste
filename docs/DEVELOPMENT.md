@@ -13,17 +13,26 @@ xcode-select --install
 
 源码构建默认不连接官方统计项目：仓库不包含 `Assets/GoogleService-Info.plist`，缺少该文件时 App 的统计开关不可用。如需接入你自己的 Firebase 项目，将该项目下载的配置文件放在 `Assets/GoogleService-Info.plist` 后重新构建；该路径已被 Git 忽略。
 
-生成的应用位于 `build/OpenPaste.app`。构建默认使用临时签名；如果你有可用的签名身份：
+生成的应用位于 `build/GuziPaste.app`。构建默认使用临时签名；如果你有可用的签名身份：
 
 ```sh
 OPENPASTE_SIGNING_IDENTITY="你的签名身份" ./build.sh
 ```
 
+使用专用钥匙串时，将 `OPENPASTE_SIGNING_KEYCHAIN` 指向已解锁的钥匙串文件，并用证书指纹指定身份。
+
+```sh
+OPENPASTE_SIGNING_IDENTITY="证书的 SHA-1 指纹" \
+OPENPASTE_SIGNING_KEYCHAIN="/path/to/GuziPaste-Release.keychain-db" ./build.sh
+```
+
+GuziPaste 的固定签名由同一张自签名证书提供。维护者应安全保存钥匙串、加密导出文件及恢复密码，并在后续版本继续使用该身份。替换证书会改变应用身份，即使证书名称相同也可能要求用户重新授权。自签名不提供 Apple Developer ID 或公证。
+
 退出正在运行的 OpenPaste，再将生成的应用复制到应用程序目录：
 
 ```sh
-ditto build/OpenPaste.app /Applications/OpenPaste.app
-open /Applications/OpenPaste.app
+ditto build/GuziPaste.app /Applications/GuziPaste.app
+open /Applications/GuziPaste.app
 ```
 
 固定签名身份有助于更新时保持应用身份，但临时签名、应用 ID 变化或系统状态变化仍可能导致权限需要重新授权。不要将证书、私钥或 API Key 提交到仓库。
@@ -32,19 +41,22 @@ open /Applications/OpenPaste.app
 
 提交到 `main` / `master` 或创建 PR 后，先编译测试可执行文件并跑单元测试，再执行安全检查；测试、代码规范和依赖漏洞扫描全部通过，且 PR 贡献者已签署 CLA 后才组装 App 并生成 ZIP。发布 Release 时也依次执行单元与集成测试、代码规范检查、依赖漏洞扫描和安全检查，再构建通用 App，上传 ZIP 与 SHA-256 校验文件。通用包包含 Apple Silicon 与 Intel 两种架构，最低支持 macOS 14。
 
-普通 CI 不注入 Firebase 配置；正式 Release 工作流从仓库 Secret `OPENPASTE_FIREBASE_CONFIG_B64` 还原官方配置，再嵌入安装包。此 Secret 已在官方仓库设置。更换 Firebase 配置时，仓库维护者可运行：
+普通 CI 不注入 Firebase 配置；上游 Release 工作流从仓库 Secret `OPENPASTE_FIREBASE_CONFIG_B64` 还原官方配置，再嵌入安装包。此 Secret 已在官方仓库设置。更换 Firebase 配置时，仓库维护者可运行：
 
 ```sh
 base64 < /path/to/GoogleService-Info.plist | tr -d '\n' | gh secret set OPENPASTE_FIREBASE_CONFIG_B64 --repo SwallOwDili/OpenPaste
 ```
 
-发布构建缺少 Secret 或配置的 Bundle ID 不匹配时会直接失败。源码仓库不存放官方配置；客户端配置仍会包含在最终 App 内。
+上游发布构建缺少 Firebase Secret 或配置的 Bundle ID 不匹配时会直接失败。GuziPaste fork 的工作流跳过上游 Firebase 注入。源码仓库不存放官方配置；客户端配置仍会包含在最终 App 内。
 
-发布步骤：
+GuziPaste 使用草稿发布流程。
 
-1. 将本项目根目录内容提交到仓库，包含 `.github/workflows/`。
-2. 在 GitHub 创建 Release，标签使用 `v0.0.5` 等 `v主版本.次版本.修订版本` 格式；也接受 `v0.0.5-rc1` 等预发布后缀。
-3. 发布后，Actions 从该标签的代码构建，完成检查后把 `OpenPaste-0.0.5-macos-universal.zip` 和 `.sha256` 上传到同一 Release。
+1. 将候选源码推送到本仓库，并在确定的提交上创建版本标签。
+2. 用该标签创建 Release 草稿，在 Actions 手动运行 **Build release**，填写草稿标签。
+3. 等待测试、检查、固定签名和通用打包完成，下载草稿中的 ZIP 与 SHA-256，执行最终包验收。
+4. 验收后发布草稿。fork 的 published 事件会跳过构建，已验收的附件原样对外提供。
+
+版本标签使用 `v0.2.0` 等格式，也接受预发布后缀。工作流手动重跑会覆盖同名附件，因此重跑后应重新验收。
 
 App 的版本来自 Release 标签，Build 来自工作流运行编号；预发布版本在「关于」页面显示完整后缀。GitHub Release 的标题不会影响版本号。工作流可重复运行，同名附件会覆盖。
 
@@ -68,7 +80,7 @@ GitHub 默认提供上传所需的 `GITHUB_TOKEN`，无需另配个人访问令�
 
 如果开启 GitHub 的不可变 Release，须先创建草稿，再在 Actions 手动运行 **Build release**、填写该草稿标签，待附件上传完成后发布。不可变 Release 发布后不能追加或替换附件，工作流会明确报错。
 
-工作流配置见 [release.yml](../.github/workflows/release.yml) 和 [ci.yml](../.github/workflows/ci.yml)。Release 只公开安装包 ZIP 与 SHA-256 校验文件；调试符号单独保留在 Actions Artifacts，保存 14 天。此流程发布安装包。App 支持正式 Release 检测；当前 App 使用固定证书签名、位于可写的应用目录时，可在应用内下载、校验并替换更新，否则提供下载页入口，由用户手动替换。
+工作流配置见 [release.yml](../.github/workflows/release.yml) 和 [ci.yml](../.github/workflows/ci.yml)。Release 只公开安装包 ZIP 与 SHA-256 校验文件；调试符号单独保留在 Actions Artifacts，保存 14 天。此流程发布安装包。App 查询 Drangon-Li/OpenPaste 的 Release，并兼容已发行的 OpenPaste 附件名。当前 App 使用固定证书签名、位于可写的应用目录时，可在应用内下载、校验并替换更新，否则提供下载页入口，由用户手动替换。
 
 ## 自动检查与 CLA
 
@@ -98,8 +110,8 @@ GitHub 默认提供上传所需的 `GITHUB_TOKEN`，无需另配个人访问令�
 窗口与键盘检查需要前台图形桌面；先退出正常实例，再运行：
 
 ```sh
-build/OpenPaste.app/Contents/MacOS/OpenPaste --layout-test
-build/OpenPaste.app/Contents/MacOS/OpenPaste --keyboard-test
+build/GuziPaste.app/Contents/MacOS/OpenPaste --layout-test
+build/GuziPaste.app/Contents/MacOS/OpenPaste --keyboard-test
 ```
 
 它们使用演示数据，通过 AppKit 事件分发验证本进程的窗口与按键处理，退出时恢复剪贴板，不向其他应用粘贴；未取得前台激活时会明确失败。这些检查不能代替真实全局快捷键、跨应用自动粘贴或多设备验收，后者按 [产品功能与边界验收](ACCEPTANCE.md) 实测。贡献方式见 [CONTRIBUTING.md](../CONTRIBUTING.md)，版本变化见 [GitHub Releases](https://github.com/SwallOwDili/OpenPaste/releases)。

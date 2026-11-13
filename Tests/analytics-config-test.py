@@ -2,7 +2,7 @@ import plistlib
 from pathlib import Path
 
 root = Path(__file__).resolve().parents[1]
-app = root / "build/OpenPaste.app/Contents"
+app = root / "build/GuziPaste.app/Contents"
 with (app / "Info.plist").open("rb") as stream:
     info = plistlib.load(stream)
 source_config = root / "Assets/GoogleService-Info.plist"

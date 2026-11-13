@@ -7,7 +7,7 @@ python3 -m unittest discover -s Tests -p '*_unit_test.py'
 python3 Tests/analytics-config-test.py
 python3 - <<'CHECK_ID'
 import plistlib
-with open('build/OpenPaste.app/Contents/Info.plist', 'rb') as stream:
+with open('build/GuziPaste.app/Contents/Info.plist', 'rb') as stream:
     assert plistlib.load(stream)['CFBundleIdentifier'] == 'io.github.SwallOwDili.OpenPaste'
 CHECK_ID
 arch="$(uname -m)"

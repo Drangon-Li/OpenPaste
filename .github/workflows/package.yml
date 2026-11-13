@@ -74,9 +74,9 @@ jobs:
         run: |
           VERSION="$(python3 scripts/version.py)"
           SAFE_VERSION="${VERSION//\//-}"
-          echo "ARTIFACT_NAME=OpenPaste-$SAFE_VERSION-macos-$(uname -m)" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=GuziPaste-$SAFE_VERSION-macos-$(uname -m)" >> "$GITHUB_ENV"
           mkdir -p build/package
-          ditto -c -k --sequesterRsrc --keepParent build/OpenPaste.app "build/package/OpenPaste-$SAFE_VERSION-macos-$(uname -m).zip"
+          ditto -c -k --sequesterRsrc --keepParent build/GuziPaste.app "build/package/GuziPaste-$SAFE_VERSION-macos-$(uname -m).zip"
           (cd build/package && shasum -a 256 ./*.zip > SHA256SUMS.txt)
       - uses: actions/upload-artifact@v4
         with:

@@ -19,6 +19,7 @@ concurrency:
 
 jobs:
   release:
+    if: github.event_name == 'workflow_dispatch' || github.repository == 'SwallOwDili/OpenPaste'
     runs-on: macos-15
     timeout-minutes: 60
     permissions:
@@ -42,7 +43,7 @@ jobs:
           VERSION="$(python3 scripts/version.py)"
           {
             echo "OPENPASTE_VERSION=$VERSION"
-            echo "ASSET_NAME=OpenPaste-$VERSION-macos-universal"
+            echo "ASSET_NAME=GuziPaste-$VERSION-macos-universal"
           } >> "$GITHUB_ENV"
           gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | @json" > "$RUNNER_TEMP/releases.jsonl"
           python3 - "$RUNNER_TEMP/releases.jsonl" <<'PY'
@@ -73,6 +74,7 @@ jobs:
         run: ./scripts/security-check.sh
 
       - name: Inject Firebase configuration
+        if: github.repository == 'SwallOwDili/OpenPaste'
         env:
           OPENPASTE_FIREBASE_CONFIG_B64: ${{ secrets.OPENPASTE_FIREBASE_CONFIG_B64 }}
         run: python3 scripts/inject_firebase_config.py
@@ -114,23 +116,23 @@ jobs:
         run: |
           python3 - <<'PY'
           import os, plistlib
-          with open('build/OpenPaste.app/Contents/Info.plist', 'rb') as stream:
+          with open('build/GuziPaste.app/Contents/Info.plist', 'rb') as stream:
               info = plistlib.load(stream)
           assert info['OpenPasteReleaseVersion'] == os.environ['OPENPASTE_VERSION']
           assert info['CFBundleShortVersionString'] == os.environ['OPENPASTE_VERSION'].split('-')[0]
           assert info['CFBundleVersion'] == os.environ['GITHUB_RUN_NUMBER']
           PY
-          lipo build/OpenPaste.app/Contents/MacOS/OpenPaste -verify_arch arm64 x86_64
-          codesign --verify --deep --strict build/OpenPaste.app
-          requirement="$(codesign -dr - build/OpenPaste.app 2>&1)"
+          lipo build/GuziPaste.app/Contents/MacOS/OpenPaste -verify_arch arm64 x86_64
+          codesign --verify --deep --strict build/GuziPaste.app
+          requirement="$(codesign -dr - build/GuziPaste.app 2>&1)"
           echo "$requirement"
-          grep -q 'certificate leaf = H"' <<< "$requirement" || { echo "::error::Signature requirement is not certificate based; Accessibility permission would reset on update."; exit 1; }
+          grep -Eq 'certificate (leaf|root) = H"' <<< "$requirement" || { echo "::error::Signature requirement is not certificate based; Accessibility permission would reset on update."; exit 1; }
           if grep -q 'cdhash' <<< "$requirement"; then echo "::error::Ad-hoc signature detected."; exit 1; fi
 
       - name: Package and checksum
         run: |
           mkdir -p build/release
-          ditto -c -k --sequesterRsrc --keepParent build/OpenPaste.app "build/release/$ASSET_NAME.zip"
+          ditto -c -k --sequesterRsrc --keepParent build/GuziPaste.app "build/release/$ASSET_NAME.zip"
           (cd build/release && shasum -a 256 "$ASSET_NAME.zip" > "$ASSET_NAME.sha256")
 
       - name: Keep workflow artifacts
@@ -145,7 +147,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ASSET_NAME }}-debug-symbols
-          path: build/OpenPaste.app.dSYM
+          path: build/GuziPaste.app.dSYM
           if-no-files-found: error
           retention-days: 14
 

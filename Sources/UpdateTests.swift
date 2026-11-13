@@ -4,10 +4,12 @@ private final class UpdateMockProtocol: URLProtocol {
     static var status = 200
     static var payload = Data()
     static var requests = 0
+    static var lastURL: URL?
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         Self.requests += 1
+        Self.lastURL = request.url
         let response = HTTPURLResponse(url: request.url!, statusCode: Self.status, httpVersion: "HTTP/1.1", headerFields: [:])!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: Self.payload)
@@ -43,8 +45,12 @@ func runUpdateTests() {
     expect(ReleaseVersion("v1.0.0-beta.2")! < ReleaseVersion("1.0.0-beta.10")!, "numeric prerelease comparison")
     expect(ReleaseVersion("1.0.0-rc.1")! < ReleaseVersion("1.0.0")!, "stable supersedes installed prerelease")
     expect(ReleaseVersion("garbage") == nil, "invalid version rejected")
-    func release(_ tag: String = "v1.2.0", draft: Bool = false, prerelease: Bool = false, url: String? = nil, assets: Bool = true) -> GitHubRelease {
-        GitHubRelease(tag_name: tag, html_url: url ?? "https://github.com/SwallOwDili/OpenPaste/releases/tag/\(tag)", body: "Demo release notes", draft: draft, prerelease: prerelease, assets: assets ? [.init(name: "OpenPaste-1.2.0-macos-universal.zip", state: "uploaded")] : [])
+    func assets(_ tag: String, product: String) -> [GitHubRelease.Asset] {
+        let stem = "\(product)-\(tag.dropFirst())-macos-universal"
+        return [.init(name: "\(stem).zip", state: "uploaded"), .init(name: "\(stem).sha256", state: "uploaded")]
+    }
+    func release(_ tag: String = "v1.2.0", draft: Bool = false, prerelease: Bool = false, url: String? = nil, names: [GitHubRelease.Asset]? = nil) -> GitHubRelease {
+        GitHubRelease(tag_name: tag, html_url: url ?? "https://github.com/Drangon-Li/OpenPaste/releases/tag/\(tag)", body: "Demo release notes", draft: draft, prerelease: prerelease, assets: names ?? assets(tag, product: "GuziPaste"))
     }
     expect(release().isNewer(than: "draft"), "draft can discover stable release")
     expect(release().isNewer(than: "feature/search-a1b2c3d4"), "branch commit build can discover stable release")
@@ -54,7 +60,9 @@ func runUpdateTests() {
     expect(!release(draft: true).isNewer(than: "1.1.0"), "draft ignored")
     expect(!release(prerelease: true).isNewer(than: "1.1.0"), "prerelease ignored")
     expect(!release(url: "https://example.com/update").isNewer(than: "1.1.0"), "untrusted download page rejected")
-    expect(!release(assets: false).hasInstaller, "release without installer held back")
+    let upstream = release(url: "https://github.com/SwallOwDili/OpenPaste/releases/tag/v1.2.0")
+    expect(!upstream.isNewer(than: "1.1.0") && !upstream.hasInstaller, "upstream releases rejected")
+    expect(!release(names: []).hasInstaller, "release without installer held back")
     let suite = "OpenPaste.UpdateTests.\(UUID().uuidString)"
     let defaults = UserDefaults(suiteName: suite)!
     defer { defaults.removePersistentDomain(forName: suite) }
@@ -62,17 +70,22 @@ func runUpdateTests() {
     config.protocolClasses = [UpdateMockProtocol.self]
     let session = URLSession(configuration: config)
     defer { session.invalidateAndCancel() }
+    expect(UpdateChecker(defaults: defaults, current: "1.1.0", session: session).automatic, "automatic checks default on")
+    defaults.set(false, forKey: "automaticUpdateChecks")
     let checker = UpdateChecker(defaults: defaults, current: "1.1.0", session: session)
-    expect(!checker.automatic, "automatic checks opt in")
-    checker.checkIfDue()
+    expect(!checker.automatic, "explicitly disabled automatic checks stay off")
+    checker.start()
     expect(!checker.checking, "disabled automatic check sends no request")
+    func waitForCheck(_ checker: UpdateChecker, _ label: String) {
+        let deadline = Date().addingTimeInterval(3)
+        while checker.checking && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        expect(!checker.checking, label)
+    }
     func check(_ status: Int, _ item: GitHubRelease? = nil, manual: Bool = true) {
         UpdateMockProtocol.status = status
         UpdateMockProtocol.payload = item.flatMap { try? JSONEncoder().encode($0) } ?? Data("invalid".utf8)
         checker.check(manual: manual)
-        let deadline = Date().addingTimeInterval(3)
-        while checker.checking && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
-        expect(!checker.checking, "request completes \(status)")
+        waitForCheck(checker, "request completes \(status)")
     }
     check(200, release())
     expect(checker.available?.version == "1.2.0", "mock HTTP response produces update")
@@ -95,7 +108,7 @@ func runUpdateTests() {
     expect(checker.message.contains("无法识别"), "malformed response reported")
     check(404)
     expect(checker.release == nil && checker.message.contains("暂未发布"), "missing release handled")
-    check(200, release(assets: false))
+    check(200, release(names: []))
     expect(checker.available == nil && checker.message.contains("仍在构建"), "published release waits for uploaded installer")
     check(200, release("v1.0.0"))
     expect(checker.available == nil && checker.message.contains("最新"), "older release never downgrades")
@@ -103,10 +116,38 @@ func runUpdateTests() {
     checker.automatic = true
     checker.checkIfDue()
     expect(UpdateMockProtocol.requests == requestCount && !checker.checking, "24 hour throttle includes manual attempt")
+    UpdateMockProtocol.payload = try! JSONEncoder().encode(release())
+    defaults.set(try! JSONEncoder().encode(upstream), forKey: "cachedGitHubRelease")
+    defaults.set("1.2.0", forKey: "skippedUpdateVersion")
+    let launchChecker = UpdateChecker(defaults: defaults, current: "1.1.0", session: session)
+    var launchOffers = [String]()
+    launchChecker.onLaunchUpdateAvailable = { launchOffers.append($0.version) }
+    expect(launchChecker.available == nil, "upstream cache ignored")
+    launchChecker.start()
+    expect(launchChecker.checking, "enabled launch check bypasses the last attempt timestamp")
+    expect(launchOffers.isEmpty, "launch does not prompt before a response")
+    waitForCheck(launchChecker, "launch request completes")
+    expect(UpdateMockProtocol.lastURL?.absoluteString == "https://api.github.com/repos/Drangon-Li/OpenPaste/releases/latest", "launch requests stable fork release")
+    expect(launchOffers == ["1.2.0"], "launch prompts once for a fresh fork release despite old upstream skip")
+    launchChecker.start()
+    expect(!launchChecker.checking && launchOffers == ["1.2.0"], "starting the same checker twice does not request or prompt again")
+    launchChecker.skip(release("v1.1.0"))
+    expect(launchChecker.available?.version == "1.2.0", "skip applies to the presented version")
+    launchChecker.skip(release())
+    let restartedChecker = UpdateChecker(defaults: defaults, current: "1.1.0", session: session)
+    restartedChecker.onLaunchUpdateAvailable = { launchOffers.append($0.version) }
+    restartedChecker.start()
+    waitForCheck(restartedChecker, "restarted checker request completes")
+    expect(launchOffers == ["1.2.0"] && restartedChecker.available == nil, "skip suppresses the same release on a new launch")
+    let disabledDuringLaunch = UpdateChecker(defaults: defaults, current: "1.1.0", session: session)
+    disabledDuringLaunch.onLaunchUpdateAvailable = { launchOffers.append($0.version) }
+    disabledDuringLaunch.start()
+    disabledDuringLaunch.automatic = false
+    expect(!disabledDuringLaunch.checking, "disabling automatic checks cancels an in-flight launch check")
+    defaults.set(true, forKey: "automaticUpdateChecks")
     // Prerelease opt-in
     func rc(_ tag: String, draft: Bool = false) -> GitHubRelease {
-        let version = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-        return GitHubRelease(tag_name: tag, html_url: "https://github.com/SwallOwDili/OpenPaste/releases/tag/\(tag)", body: nil, draft: draft, prerelease: tag.contains("-"), assets: [.init(name: "OpenPaste-\(version)-macos-universal.zip", state: "uploaded"), .init(name: "OpenPaste-\(version)-macos-universal.sha256", state: "uploaded")])
+        return release(tag, draft: draft, prerelease: tag.contains("-"), names: assets(tag, product: "OpenPaste"))
     }
     expect(rc("v0.0.4-rc1").isNewer(than: "0.0.3", includePrerelease: true), "prerelease offered when opted in")
     expect(!rc("v0.0.4-rc1").isNewer(than: "0.0.3"), "prerelease hidden by default")
@@ -131,11 +172,16 @@ func runUpdateTests() {
     expect(optIn.available == nil, "opting out clears rc offer immediately")
     // Installer addressing
     let target = rc("v0.0.4-rc1")
-    expect(target.installerName == "OpenPaste-0.0.4-rc1-macos-universal.zip" && target.checksumName == "OpenPaste-0.0.4-rc1-macos-universal.sha256", "installer and checksum located by exact name")
-    expect(target.assetURL("OpenPaste-0.0.4-rc1-macos-universal.zip")?.absoluteString == "https://github.com/SwallOwDili/OpenPaste/releases/download/v0.0.4-rc1/OpenPaste-0.0.4-rc1-macos-universal.zip", "asset URL built from tag and name")
+    expect(target.installer?.appName == "OpenPaste.app" && target.installer?.checksumName == "OpenPaste-0.0.4-rc1-macos-universal.sha256", "legacy installer and checksum located by exact name")
+    expect(target.assetURL("OpenPaste-0.0.4-rc1-macos-universal.zip")?.absoluteString == "https://github.com/Drangon-Li/OpenPaste/releases/download/v0.0.4-rc1/OpenPaste-0.0.4-rc1-macos-universal.zip", "asset URL built from fork, tag and name")
     expect(target.assetURL("../evil.zip") == nil && target.assetURL("OpenPaste-1.0.0-macos-universal.zip/../x") == nil && target.assetURL("other.zip") == nil, "asset names outside the pattern rejected")
-    let noChecksum = GitHubRelease(tag_name: target.tag_name, html_url: target.html_url, body: nil, draft: false, prerelease: true, assets: [.init(name: "OpenPaste-0.0.4-rc1-macos-universal.zip", state: "uploaded")])
-    expect(noChecksum.checksumName == nil, "missing checksum detected")
+    let modernAssets = assets("v1.2.0", product: "GuziPaste")
+    let legacyAssets = assets("v1.2.0", product: "OpenPaste")
+    expect(release(names: legacyAssets + modernAssets).installer?.appName == "GuziPaste.app", "prefer the new complete asset pair")
+    expect(release(names: [modernAssets[0]] + legacyAssets).installer?.appName == "OpenPaste.app", "an incomplete new pair falls back to the complete legacy pair")
+    expect(!release(names: [modernAssets[0], legacyAssets[1]]).hasInstaller, "ZIP and checksum with different prefixes are refused")
+    expect(!release(names: [modernAssets[0]]).hasInstaller, "missing checksum holds back release")
+    expect(release().assetURL("GuziPaste-9.9.9-macos-universal.zip") == nil, "asset for another version refused")
     let digest = String(repeating: "ab", count: 32)
     expect(UpdateVerification.expectedChecksum(from: "\(digest)  OpenPaste-x.zip\n", fileName: "OpenPaste-x.zip") == digest, "shasum line parsed")
     expect(UpdateVerification.expectedChecksum(from: digest.uppercased(), fileName: "any.zip") == digest, "bare digest parsed and lowercased")
@@ -149,8 +195,8 @@ func runUpdateTests() {
     expect(UpdateVerification.isAllowedDownloadHost(URL(string: "https://github.com/a")) && UpdateVerification.isAllowedDownloadHost(URL(string: "https://release-assets.githubusercontent.com/x")), "GitHub hosts allowed")
     expect(!UpdateVerification.isAllowedDownloadHost(URL(string: "http://github.com/a")) && !UpdateVerification.isAllowedDownloadHost(URL(string: "https://evilgithub.com/a")) && !UpdateVerification.isAllowedDownloadHost(URL(string: "https://github.com.evil.example/a")) && !UpdateVerification.isAllowedDownloadHost(URL(string: "https://u:p@github.com/a")), "non-GitHub or insecure hosts refused")
     expect(UpdateVerification.isCertificateBased(requirement: "identifier \"x\" and certificate leaf = H\"ab\"") && !UpdateVerification.isCertificateBased(requirement: "cdhash H\"ab\" or cdhash H\"cd\""), "ad-hoc requirement is not certificate based")
-    expect(UpdateVerification.isExpectedArchiveLayout(["OpenPaste.app"]) && UpdateVerification.isExpectedArchiveLayout(["OpenPaste.app", "__MACOSX"]), "single app archive accepted")
-    expect(!UpdateVerification.isExpectedArchiveLayout([]) && !UpdateVerification.isExpectedArchiveLayout(["OpenPaste.app", "run.sh"]) && !UpdateVerification.isExpectedArchiveLayout(["Other.app"]), "unexpected archive contents rejected")
+    expect(UpdateVerification.isExpectedArchiveLayout(["GuziPaste.app"], appName: "GuziPaste.app") && UpdateVerification.isExpectedArchiveLayout(["OpenPaste.app", "__MACOSX"], appName: "OpenPaste.app"), "new and legacy single app archives accepted")
+    expect(!UpdateVerification.isExpectedArchiveLayout([], appName: "GuziPaste.app") && !UpdateVerification.isExpectedArchiveLayout(["GuziPaste.app", "run.sh"], appName: "GuziPaste.app") && !UpdateVerification.isExpectedArchiveLayout(["OpenPaste.app"], appName: "GuziPaste.app"), "unexpected archive contents rejected")
     // Eligibility of the running copy
     let appDir = scratch.appendingPathComponent("Apps", isDirectory: true)
     let fakeApp = appDir.appendingPathComponent("OpenPaste.app", isDirectory: true)
