@@ -56,6 +56,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     var status: NSStatusItem!
     var updateMenuItem: NSMenuItem?
     var pendingLaunchUpdate: GitHubRelease?
+    var pendingInstallPrompt = false
     var presentedUpdateTags = Set<String>()
     var target: NSRunningApplication?
     var hotkey: EventHotKeyRef?
@@ -91,6 +92,16 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     lazy var recordingPausePersistence = RecordingPausePersistence(defaults: AppEnvironment.current.defaults)
     var settingsWindow: NSWindow?
     var accessibilityGuideWindow: NSPanel?
+    var accessibilityGuideGeneration = 0
+    var accessibilitySystemInteractionPending = false
+    var accessibilitySystemInteractionLeftApp = false
+    var accessibilitySystemInteractionGeneration = 0
+    var updatesRequireActiveAppAfterPermission = false
+    let accessibilityAuthorization = AccessibilityAuthorization()
+    lazy var accessibilityOnboarding = AccessibilityOnboarding(defaults: AppEnvironment.current.defaults)
+    var accessibilityOnboardingPending = false
+    var launchPermissionCheckReady = false
+    var launchWindowPresentation: (() -> Void)?
     var settingsRequest = 0
     var activationObserver: NSObjectProtocol?
     var lastExternalApp: NSRunningApplication?
@@ -112,6 +123,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             if store.directPasteAuthorized != allowed { store.directPasteAuthorized = allowed }
             if store.translationSelectionAuthorized != state.accessibility { store.translationSelectionAuthorized = state.accessibility }
             if store.permissionStatus != status { store.permissionStatus = status }
+            completeAccessibilityOnboardingCheck(state)
         })
     var modalShowing = false
     func prepareAlert(_ alert: NSAlert) {
@@ -141,11 +153,19 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         return alert.runModal()
     }
     func refreshPermission() {
+        guard !accessibilityOnboardingPending || launchPermissionCheckReady else { return }
         permissionMonitor.refresh()
     }
+    func applicationDidResignActive(_ notification: Notification) {
+        if accessibilitySystemInteractionPending { accessibilitySystemInteractionLeftApp = true }
+    }
     func applicationDidBecomeActive(_ notification: Notification) {
+        if accessibilitySystemInteractionLeftApp {
+            finishAccessibilitySystemInteraction()
+        }
         refreshPermission()
         restoreWorkingWindowFocus()
+        if pendingInstallPrompt { promptInstallReady() }
     }
     var directPasteAllowed: Bool {
         directPasteAllowed(accessibility: AXIsProcessTrusted(), eventPosting: CGPreflightPostEventAccess())
@@ -158,6 +178,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         AcceptanceMetrics.start()
         AppDiagnostics.record("app.launch")
         Controller.shared = self
+        accessibilityOnboardingPending = !preview && !TestMode.active && accessibilityOnboarding.needsCheck
         applyInterfaceAppearance()
         let finishStoreInit = AcceptanceMetrics.begin("launch.store-init")
         _ = store
@@ -501,13 +522,43 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             show()
             if CommandLine.arguments.contains("--settings") { let finish = AcceptanceMetrics.begin("launch.open-settings"); openSettings(); finish() }
             if TestMode.translationUI { translateSelection("Hello\n    world") }
-        } else if !AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { onboarding() }
-        else {
-            let finishStart = AcceptanceMetrics.begin("launch.store-start"); store.start(); finishStart()
-            if CommandLine.arguments.contains("--settings") { let finish = AcceptanceMetrics.begin("launch.open-settings"); openSettings(); finish() }
+        } else {
+            let needsRecordingConsent = !AppEnvironment.current.defaults.bool(forKey: "recordingAccepted")
+            if needsRecordingConsent { onboarding(showShelfOnCompletion: false) }
+            else {
+                let finishStart = AcceptanceMetrics.begin("launch.store-start"); store.start(); finishStart()
+            }
+            launchWindowPresentation = { [weak self] in
+                guard let self else { return }
+                if CommandLine.arguments.contains("--settings") {
+                    let finish = AcceptanceMetrics.begin("launch.open-settings"); self.openSettings(); finish()
+                } else if needsRecordingConsent { self.show() }
+            }
+            if accessibilityOnboardingPending {
+                launchPermissionCheckReady = true
+                refreshPermission()
+            } else { finishLaunchWindowPresentation() }
         }
     }
-    func onboarding() {
+    func completeAccessibilityOnboardingCheck(_ state: PermissionState) {
+        guard accessibilityOnboardingPending, launchPermissionCheckReady, !modalShowing else { return }
+        accessibilityOnboardingPending = false
+        launchPermissionCheckReady = false
+        let shouldOffer = accessibilityOnboarding.consumeOffer(state: state,
+            recordingAccepted: AppEnvironment.current.defaults.bool(forKey: "recordingAccepted"),
+            pasteOnReturn: store.pasteOnReturn)
+        if panel.isVisible || store.settings {
+            launchWindowPresentation = nil
+        } else if shouldOffer {
+            showAccessibilityGuide(for: .directPaste, requestOnOpen: false)
+        } else { finishLaunchWindowPresentation() }
+    }
+    func finishLaunchWindowPresentation() {
+        let presentation = launchWindowPresentation
+        launchWindowPresentation = nil
+        presentation?()
+    }
+    func onboarding(showShelfOnCompletion: Bool = true) {
         let sourceApp = resolveExternalTarget()
         let initialSource = sourceApp.map { ClipboardCaptureSource(name: $0.localizedName ?? "未知应用", bundleID: $0.bundleIdentifier ?? "") }
         let initialChangeCount = NSPasteboard.general.changeCount
@@ -528,7 +579,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         }
         store.setRecordingAccepted(accepted)
         if accepted { store.start(initialSource: initialSource, initialChangeCount: initialChangeCount) }
-        show()
+        if showShelfOnCompletion { show() }
     }
     func resolveExternalTarget(frontmost: NSRunningApplication? = NSWorkspace.shared.frontmostApplication) -> NSRunningApplication? {
         [frontmost, lastExternalApp, target].compactMap { $0 }.first {
@@ -551,6 +602,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         let finishTiming = AcceptanceMetrics.begin("shelf.show"); defer { finishTiming() }
         guard prepareShelfPresentation({ [weak self] in self?.showShelf(activating: activating) }) else { return }
         guard !store.changingDataDirectory else { openSettings(); return }
+        dismissAccessibilityGuideForNavigation()
         shelfPresentation += 1
         pendingOutsideClick = false
         pendingApplicationSwitch = false
@@ -661,7 +713,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func restoreWorkingWindowFocus() {
         guard NSApp.isActive, NSApp.keyWindow == nil, !interactionState.menuTracking, NSApp.modalWindow == nil else { return }
-        let windows = [editorWindow, previewWindow, settingsWindow, panel].compactMap { $0 }.filter(\.isVisible)
+        let windows = [editorWindow, previewWindow, accessibilityGuideWindow, settingsWindow, panel].compactMap { $0 }.filter(\.isVisible)
         if let sheet = windows.compactMap(\.attachedSheet).first {
             sheet.makeKeyAndOrderFront(nil)
         } else if !modalShowing, let window = windows.first, window !== panel {
@@ -730,6 +782,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func openSettings(page: SettingsPage? = nil) {
         let finishTiming = AcceptanceMetrics.begin("settings.open"); defer { finishTiming() }
+        dismissAccessibilityGuideForNavigation()
         rememberExternalTarget()
         settingsRequest += 1
         store.settings = true
@@ -803,6 +856,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             return
         }
         guard !interactionState.hasModalInteraction, !interactionState.menuTracking,
+              !accessibilityOnboardingPending, accessibilityGuideWindow?.isVisible != true,
+              !accessibilityAuthorization.isRequesting, !accessibilitySystemInteractionPending,
+              !updatesRequireActiveAppAfterPermission || NSApp.isActive,
               previewPopover == nil, editorWindow?.isVisible != true,
               !store.importingPaste, !store.changingDataDirectory, !panel.isVisible,
               !store.recordingShortcut, store.recordingChord == nil else {
@@ -844,7 +900,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         }
     }
     func showUpdateResultIfNeeded() {
-        guard !interactionState.hasModalInteraction, !interactionState.menuTracking else {
+        guard !interactionState.hasModalInteraction, !interactionState.menuTracking,
+              !accessibilityOnboardingPending, accessibilityGuideWindow?.isVisible != true,
+              !accessibilityAuthorization.isRequesting, !accessibilitySystemInteractionPending,
+              !updatesRequireActiveAppAfterPermission || NSApp.isActive else {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in self?.showUpdateResultIfNeeded() }
             return
         }
@@ -863,7 +922,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func promptInstallReady() {
         let installer = UpdateInstaller.shared
-        guard installer.phase == .ready, let release = installer.preparedRelease, !modalShowing else { return }
+        guard installer.phase == .ready, let release = installer.preparedRelease else {
+            pendingInstallPrompt = false
+            return
+        }
+        guard !modalShowing else { return }
+        guard !accessibilityOnboardingPending, accessibilityGuideWindow?.isVisible != true,
+              !accessibilityAuthorization.isRequesting, !accessibilitySystemInteractionPending,
+              !updatesRequireActiveAppAfterPermission || NSApp.isActive else {
+            pendingInstallPrompt = true
+            return
+        }
+        pendingInstallPrompt = false
         openSettings(page: .about)
         let alert = NSAlert()
         alert.messageText = "GuziPaste \(release.version) 已准备好"
@@ -1028,7 +1098,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     }
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         let finishTiming = AcceptanceMetrics.begin("app.reopen"); defer { finishTiming() }
-        let workingWindows = [editorWindow, previewWindow, settingsWindow].compactMap { $0 }.filter(\.isVisible)
+        if !accessibilityAuthorization.isRequesting { finishAccessibilitySystemInteraction() }
+        let workingWindows = [editorWindow, previewWindow, accessibilityGuideWindow, settingsWindow].compactMap { $0 }.filter(\.isVisible)
         var visibleWindows = workingWindows
         if let panel, panel.isVisible { visibleWindows.append(panel) }
         let attachedSheet = visibleWindows.compactMap(\.attachedSheet).first
@@ -1051,6 +1122,18 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         return true
     }
     func windowWillClose(_ notification: Notification) {
+        if notification.object as? NSWindow === accessibilityGuideWindow {
+            accessibilityGuideGeneration += 1
+            let generation = accessibilityGuideGeneration
+            if accessibilityAuthorization.isRequesting || accessibilityAuthorization.hasRequested || accessibilitySystemInteractionPending {
+                launchWindowPresentation = nil
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.accessibilityGuideGeneration == generation else { return }
+                self.finishLaunchWindowPresentation()
+                self.resumeUpdatesAfterAccessibilityGuide()
+            }
+        }
         if let window = notification.object as? NSWindow, window === settingsWindow { cancelShortcutRecording(); store.settings = false }
         if let window = notification.object as? NSWindow, window === editorWindow {
             if window === editorWindow { editorWindow = nil }
@@ -1141,25 +1224,58 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         NSWorkspace.shared.open(url)
     }
     func requestAccessibility(for purpose: AccessibilityGuide.Purpose = .directPaste) {
+        accessibilityOnboarding.markHandled()
+        accessibilityOnboardingPending = false
+        launchPermissionCheckReady = false
+        showAccessibilityGuide(for: purpose, requestOnOpen: true)
+    }
+    func dismissAccessibilityGuideForNavigation() {
+        if !accessibilityAuthorization.isRequesting { finishAccessibilitySystemInteraction() }
+        guard accessibilityGuideWindow?.isVisible == true else { return }
+        launchWindowPresentation = nil
+        accessibilityGuideWindow?.close()
+    }
+    func beginAccessibilitySystemInteraction() {
+        accessibilitySystemInteractionGeneration += 1
+        updatesRequireActiveAppAfterPermission = true
+        accessibilitySystemInteractionPending = true
+        accessibilitySystemInteractionLeftApp = !NSApp.isActive
+    }
+    func finishAccessibilitySystemInteraction() {
+        accessibilitySystemInteractionPending = false
+        accessibilitySystemInteractionLeftApp = false
+    }
+    func resumeUpdatesAfterAccessibilityGuide() {
+        guard accessibilityGuideWindow?.isVisible != true, !accessibilityAuthorization.isRequesting else { return }
+        finishAccessibilitySystemInteraction()
+        if pendingInstallPrompt { promptInstallReady() }
+    }
+    func showAccessibilityGuide(for purpose: AccessibilityGuide.Purpose, requestOnOpen: Bool) {
+        accessibilityGuideGeneration += 1
         closeSettings()
         closePreview(animated: false)
+        cancelTranslation()
+        shelfPresentation += 1
+        shelfAwaitingActivation = false
         logInteraction("shelf.hide", reason: "permission-settings")
         panel.orderOut(nil)
         let guide: NSPanel
         if let existing = accessibilityGuideWindow {
             guide = existing
         } else {
-            guide = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 380, height: 540),
+            guide = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 420, height: 560),
                                 styleMask: [.titled, .closable, .nonactivatingPanel], backing: .buffered, defer: false)
             guide.title = "GuziPaste 授权指引"
             guide.isReleasedWhenClosed = false
             guide.hidesOnDeactivate = false
-            guide.level = .floating
+            guide.level = .normal
+            guide.delegate = self
             guide.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
             accessibilityGuideWindow = guide
         }
         let appURL = Bundle.main.bundleURL.standardizedFileURL.resolvingSymlinksInPath()
-        let view = AccessibilityGuide(store: store, purpose: purpose, appURL: appURL,
+        let view = AccessibilityGuide(store: store, authorization: accessibilityAuthorization, purpose: purpose, appURL: appURL,
+            requestPermission: { [weak self] in self?.requestAccessibilityPermission(for: purpose) },
             openSettings: { [weak self] in self?.openAccessibilitySystemSettings() },
             close: { [weak guide] in guide?.close() })
         if let host = guide.contentView as? NSHostingView<AccessibilityGuide> {
@@ -1173,12 +1289,34 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             let frame = screen.visibleFrame
             guide.setFrameOrigin(NSPoint(x: frame.minX + 24, y: frame.midY - guide.frame.height / 2))
         }
-        openAccessibilitySystemSettings()
         guide.orderFrontRegardless()
         refreshPermission()
+        if requestOnOpen { requestAccessibilityPermission(for: purpose) }
+    }
+    func requestAccessibilityPermission(for purpose: AccessibilityGuide.Purpose) {
+        let appURL = Bundle.main.bundleURL.standardizedFileURL.resolvingSymlinksInPath()
+        guard AccessibilityAuthorization.canRequest(appURL: appURL), !accessibilityAuthorization.isRequesting else { return }
+        beginAccessibilitySystemInteraction()
+        let interactionGeneration = accessibilitySystemInteractionGeneration
+        let generation = accessibilityGuideGeneration
+        accessibilityAuthorization.request(for: purpose, appURL: appURL) { [weak self] result in
+            guard let self else { return }
+            AppDiagnostics.record("accessibility-guide.request", ["result": String(describing: result)])
+            self.refreshPermission()
+            if case .alreadyAuthorized = result,
+               self.accessibilityGuideGeneration == generation, self.accessibilityGuideWindow?.isVisible == true {
+                self.openAccessibilitySystemSettings()
+            } else if result == .alreadyAuthorized || result == .unavailable {
+                if self.accessibilitySystemInteractionGeneration == interactionGeneration { self.finishAccessibilitySystemInteraction() }
+            }
+            self.resumeUpdatesAfterAccessibilityGuide()
+        }
     }
     func openAccessibilitySystemSettings() {
-        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
+        beginAccessibilitySystemInteraction()
+        if !NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!) {
+            finishAccessibilitySystemInteraction()
+        }
     }
     func renameBoard(_ board: Board) {
         let alert = NSAlert(); alert.messageText = "重命名收藏板"
