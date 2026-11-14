@@ -78,7 +78,6 @@ struct GitHubRelease: Codable {
 }
 final class UpdateChecker: ObservableObject {
     static let shared = UpdateChecker()
-    static let aboutNotification = Notification.Name("OpenPasteShowAbout")
     @Published var automatic: Bool { didSet {
         guard automatic != oldValue else { return }
         defaults.set(automatic, forKey: "automaticUpdateChecks")

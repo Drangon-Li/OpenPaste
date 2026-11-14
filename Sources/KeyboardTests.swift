@@ -612,8 +612,13 @@ func runPreviewToggleTests(controller: Controller) async {
     controller.target = nil
     controller.lastExternalApp = nil
     NSApp.setActivationPolicy(.regular)
-    NSApp.activate()
-    await pause(100)
+    NSApp.activate(ignoringOtherApps: true)
+    let processID = ProcessInfo.processInfo.processIdentifier
+    await waitUntil { NSApp.isActive && NSWorkspace.shared.frontmostApplication?.processIdentifier == processID }
+    guard NSApp.isActive, NSWorkspace.shared.frontmostApplication?.processIdentifier == processID else {
+        check(false, "environment: preview fixture must own system foreground before testing window focus")
+        return
+    }
     await checkShelfReopen()
 
     for interval: UInt64 in [30, 60, 100] {

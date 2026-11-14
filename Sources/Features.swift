@@ -233,6 +233,7 @@ extension Controller {
     func showPreview(_ clip: Clip) {
         let finishTiming = AcceptanceMetrics.begin("preview.open"); defer { finishTiming() }
         closePreview(animated: false)
+        let finishContentTiming = AcceptanceMetrics.begin("preview.content")
         let popover = NSPopover()
         popover.behavior = .applicationDefined
         popover.animates = false
@@ -242,11 +243,14 @@ extension Controller {
         popover.contentViewController = host
         popover.contentSize = previewSize(for: clip)
         previewPopover = popover; previewHost = host; previewClipID = clip.id
+        finishContentTiming()
+        let finishShowTiming = AcceptanceMetrics.begin("preview.show")
         if let anchor = previewAnchor(for: clip.id) {
             popover.show(relativeTo: anchor.rect, of: anchor.view, preferredEdge: anchor.edge)
         } else if let content = panel.contentView {
             popover.show(relativeTo: NSRect(x: content.bounds.midX, y: content.bounds.midY, width: 1, height: 1), of: content, preferredEdge: .maxY)
         }
+        finishShowTiming()
         guard let window = previewWindow else { finishPreviewClose(popover); return }
         if previewAnimationsEnabled {
             window.alphaValue = 0.25
