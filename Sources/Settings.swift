@@ -348,8 +348,8 @@ struct SettingsPageView: View {
                 HStack { Label("直接粘贴", systemImage: "keyboard"); Spacer(); Label(store.permissionStatus, systemImage: store.directPasteAuthorized ? "checkmark.circle.fill" : "exclamationmark.circle").font(.caption).foregroundStyle(store.directPasteAuthorized ? Color.green : Color.orange) }
                 toggleRow("按回车直接粘贴", isOn: $store.pasteOnReturn)
                 note("开启且系统已授权时，按回车会粘贴到原输入框。关闭或未授权时，按回车只复制，可手动按 ⌘V 粘贴。")
-                Button("授权指引…") { Controller.shared.requestAccessibility() }
-                if !store.directPasteAuthorized { note("找不到 GuziPaste 时，打开授权指引，将应用图标拖入辅助功能列表。") }
+                Button(store.directPasteAuthorized ? "查看辅助功能设置…" : "请求辅助功能权限…") { Controller.shared.requestAccessibility() }
+                if !store.directPasteAuthorized { note("点击后 GuziPaste 会向系统请求权限。请在系统提示中打开设置，开启 GuziPaste 的开关；返回应用后会自动检查结果。") }
             }
             group("排除应用") {
                 note("这些应用的复制内容不会记录，也不会执行快速翻译。每行填写一个 Bundle ID。")

@@ -8,13 +8,15 @@ struct AccessibilityGuide: View {
     }
 
     @ObservedObject var store: Store
+    @ObservedObject var authorization: AccessibilityAuthorization
     let purpose: Purpose
     let appURL: URL
+    let requestPermission: () -> Void
     let openSettings: () -> Void
     let close: () -> Void
 
-    private var canDrag: Bool {
-        appURL.pathExtension == "app" && !UpdateVerification.isTranslocated(appURL)
+    private var canRequest: Bool {
+        AccessibilityAuthorization.canRequest(appURL: appURL)
     }
 
     private var title: String {
@@ -38,81 +40,103 @@ struct AccessibilityGuide: View {
         }
     }
 
+    private var explanation: String {
+        switch purpose {
+        case .directPaste: return "辅助功能权限用于向原输入框发送粘贴快捷键。稍后开启也能继续复制内容。"
+        case .selection: return "辅助功能权限用于读取其他应用中选中的文字。稍后开启也能继续使用剪贴板历史。"
+        }
+    }
+
     var body: some View {
-        VStack(spacing: 12) {
-            Text(title).font(.system(size: 22, weight: .semibold)).multilineTextAlignment(.center)
-            Label(status, systemImage: isAuthorized ? "checkmark.circle.fill" : "hand.raised")
-                .font(.callout).foregroundStyle(isAuthorized ? Color.green : Color.secondary)
-            if canDrag {
-                Text("把下面的应用图标拖到辅助功能列表，再开启它的权限开关。")
-                    .font(.callout).multilineTextAlignment(.center)
-                ApplicationDragIcon(appURL: appURL).frame(width: 80, height: 80)
-                VStack(spacing: 4) {
-                    Text(appURL.lastPathComponent).font(.headline)
-                    Text(appURL.deletingLastPathComponent().path)
-                        .font(.caption).foregroundStyle(.secondary).lineLimit(2).truncationMode(.middle)
-                }
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("列表里只有 OpenPaste 时，也请添加当前版本。拖拽无效时，点击系统列表下方的「+」，按访达显示的位置选择当前应用。")
-                    if !isAuthorized {
-                        Text("开关已开启但权限未生效时，请退出并重新打开 GuziPaste。如果仍未生效，请移除旧的 OpenPaste 条目，再添加当前版本。")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack(spacing: 12) {
+                    Image(nsImage: NSApp.applicationIconImage)
+                        .resizable().scaledToFit().frame(width: 52, height: 52)
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(title).font(.system(size: 20, weight: .semibold))
+                        Label(status, systemImage: isAuthorized ? "checkmark.circle.fill" : "hand.raised")
+                            .font(.callout).foregroundStyle(isAuthorized ? Color.green : Color.secondary)
                     }
                 }
-                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("当前应用位置").font(.subheadline.weight(.medium))
+                    Text(verbatim: appURL.path)
+                        .font(.caption).foregroundStyle(.secondary).textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                if !canRequest {
+                    Text("请先将 GuziPaste.app 放入「应用程序」，从那里重新打开后再授权。")
+                        .font(.callout)
+                    if appURL.isFileURL { showInFinder }
+                } else if !isAuthorized {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(explanation)
+                        Text("系统提示出现后，按提示打开辅助功能设置并开启 GuziPaste 的开关。返回后，应用会自动检查权限。")
+                    }
+                    .font(.callout)
+                }
+
+                HStack(spacing: 10) {
+                    Spacer()
+                    if !canRequest {
+                        Button("关闭", action: close).buttonStyle(.bordered)
+                    } else if isAuthorized {
+                        Button("查看辅助功能设置", action: openSettings).buttonStyle(.bordered)
+                        Button("完成", action: close).buttonStyle(.borderedProminent)
+                    } else {
+                        Button("稍后", action: close).buttonStyle(.bordered)
+                        primaryPermissionButton
+                    }
+                }
+
+                if canRequest && !isAuthorized { recovery }
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(width: 420)
+    }
+
+    private var primaryPermissionButton: some View {
+        Group {
+            if authorization.isRequesting {
+                Button("正在请求…", action: requestPermission).disabled(true)
+            } else if purpose == .directPaste && store.translationSelectionAuthorized &&
+                        !store.directPasteAuthorized && authorization.lastRequest != .eventPostingPrompt {
+                Button("请求粘贴按键权限", action: requestPermission)
+            } else if authorization.hasRequested {
+                Button("打开辅助功能设置", action: openSettings)
             } else {
-                Image(nsImage: NSApp.applicationIconImage).resizable().scaledToFit().frame(width: 72, height: 72)
-                Text("请先将 GuziPaste.app 放入「应用程序」并从那里重新打开，再添加辅助功能权限。")
-                    .font(.callout).multilineTextAlignment(.center)
-                Text("当前应用位于临时路径，或没有从应用包运行。")
-                    .font(.caption).foregroundStyle(.secondary)
+                Button("请求辅助功能权限", action: requestPermission)
             }
-            Button("打开辅助功能设置", action: openSettings).buttonStyle(.borderedProminent)
-            if canDrag {
-                Button("在访达中显示应用") { NSWorkspace.shared.activateFileViewerSelecting([appURL]) }
-                    .buttonStyle(.link)
+        }
+        .buttonStyle(.borderedProminent)
+    }
+
+    private var showInFinder: some View {
+        Button("在访达中显示当前位置") { NSWorkspace.shared.activateFileViewerSelecting([appURL]) }
+            .buttonStyle(.link)
+    }
+
+    private var recovery: some View {
+        DisclosureGroup("找不到应用或权限未生效") {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("列表中没有当前应用时，点击辅助功能列表下方的「+」，按访达显示的位置选择当前应用，再开启它的开关。")
+                Text("旧 OpenPaste 的开关可能对应其他版本。当前应用的开关已开启但仍未生效时，先退出并重新打开 GuziPaste。仍有问题时，可在系统设置移除失效的旧条目，再添加当前应用。")
+                showInFinder
+                if authorization.hasRequested {
+                    Button("再次请求权限", action: requestPermission)
+                        .buttonStyle(.link).disabled(authorization.isRequesting)
+                }
             }
-            Button(isAuthorized ? "完成" : "稍后", action: close).buttonStyle(.link)
+            .font(.callout)
+            .padding(.top, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
-}
-
-struct ApplicationDragIcon: NSViewRepresentable {
-    let appURL: URL
-
-    final class IconView: NSImageView, NSDraggingSource {
-        var appURL: URL?
-        private var mouseDownEvent: NSEvent?
-        override var intrinsicContentSize: NSSize { NSSize(width: 80, height: 80) }
-        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-        override func mouseDown(with event: NSEvent) { mouseDownEvent = event }
-        override func mouseUp(with event: NSEvent) { mouseDownEvent = nil }
-        override func mouseDragged(with event: NSEvent) {
-            guard let appURL, let image, let mouseDownEvent else { return }
-            self.mouseDownEvent = nil
-            let item = NSDraggingItem(pasteboardWriter: appURL as NSURL)
-            item.setDraggingFrame(bounds, contents: image)
-            beginDraggingSession(with: [item], event: mouseDownEvent, source: self)
-        }
-        func draggingSession(_ session: NSDraggingSession, willBeginAt screenPoint: NSPoint) {
-            AppDiagnostics.record("accessibility-guide.drag-begin")
-        }
-        func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
-            AppDiagnostics.record("accessibility-guide.drag-end", ["operation": String(operation.rawValue)])
-        }
-        func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation { .copy }
-        func ignoreModifierKeys(for session: NSDraggingSession) -> Bool { true }
-    }
-
-    func makeNSView(context: Context) -> IconView {
-        let view = IconView()
-        view.image = NSApp.applicationIconImage
-        view.imageScaling = .scaleProportionallyUpOrDown
-        view.setAccessibilityLabel("拖拽 GuziPaste 应用图标")
-        view.setAccessibilityHelp("拖到系统设置的辅助功能应用列表")
-        view.toolTip = "拖入辅助功能列表以添加当前 GuziPaste"
-        return view
-    }
-    func updateNSView(_ view: IconView, context: Context) { view.appURL = appURL }
 }
