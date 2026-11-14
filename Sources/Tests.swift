@@ -294,11 +294,34 @@ func runNavigationTests() {
     guard PreviewMetadata.colorSummary(hex: "#564326") == "RGB 86, 67, 38 · HSL 36, 39, 24 · HSB 36, 56, 34",
           PreviewMetadata.colorSummary(hex: "#FFFFFF") == "RGB 255, 255, 255 · HSL 0, 0, 100 · HSB 0, 0, 100",
           PreviewMetadata.colorSummary(hex: "not a colour") == nil,
-          PreviewMetadata.textSummary("hello world\nsecond line") == "23 个字符 · 4 个词 · 2 行",
-          PreviewMetadata.textSummary("") == "0 个字符 · 0 个词 · 0 行",
-          PreviewMetadata.imageSize(fixtureImage())?.width == 3200 else {
-        print("FAIL: preview metadata", PreviewMetadata.colorSummary(hex: "#564326") ?? "nil", PreviewMetadata.colorSummary(hex: "#FFFFFF") ?? "nil", PreviewMetadata.textSummary("hello world\nsecond line"), PreviewMetadata.textSummary(""), PreviewMetadata.imageSize(fixtureImage()) as Any); exit(1) }
-    print("PASS: preview footer metadata")
+          PreviewMetadata.imageSize(fixtureImage())?.width == 3200 else { print("FAIL: preview color and image metadata"); exit(1) }
+    print("PASS: preview color and image metadata")
+
+    let summaryFinished = DispatchSemaphore(value: 0)
+    Task.detached(priority: .userInitiated) {
+        defer { summaryFinished.signal() }
+        guard pthread_main_np() == 0 else { print("FAIL: preview text summary runs on the main thread"); exit(1) }
+        let longText = String(repeating: "word\n", count: 40_000) + "tail"
+        let fixtures = [
+            ("hello world\nsecond line", "23 个字符 · 4 个词 · 2 行"),
+            ("hello 你\nbonjour", "15 个字符 · 3 个词 · 2 行"),
+            ("👩🏽‍💻 café\n再", "8 个字符 · 3 个词 · 2 行"),
+            ("", "0 个字符 · 0 个词 · 0 行"),
+            (longText, "200004 个字符 · 40000+ 个词 · 40001+ 行")
+        ]
+        for (text, expected) in fixtures {
+            let actual = PreviewMetadata.textSummary(text)
+            guard actual == expected else {
+                print("FAIL: preview text summary", "expected", expected, "actual", actual ?? "nil")
+                exit(1)
+            }
+        }
+        withUnsafeCurrentTask { $0?.cancel() }
+        guard PreviewMetadata.textSummary(longText) == nil else { print("FAIL: canceled preview text summary returns a value"); exit(1) }
+    }
+    guard summaryFinished.wait(timeout: .now() + 5) == .success else { print("FAIL: preview text summary task timed out"); exit(1) }
+    print("PASS: preview text summaries preserve counts off the main thread and honor cancellation")
+
     let screen = CGSize(width: 1512, height: 900)
     let colorSize = PreviewLayout.size(for: Clip(source: "x", sourceID: "", kind: "颜色", title: "c", text: "#564326", parts: []), screen: screen)
     let textSize = PreviewLayout.size(for: plainClip, screen: screen)

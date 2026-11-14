@@ -58,13 +58,13 @@ GuziPaste 将复制过的文字、链接、图片和文件引用放进贴近屏�
 
 ## 安装
 
-需要 **macOS 14 或更新版本**。下载 `GuziPaste-0.2.1-macos-universal.zip`，解压后将 `GuziPaste.app` 放入「应用程序」。通用包包含 Apple Silicon 和 Intel 架构。 [下载 v0.2.1](https://github.com/Drangon-Li/OpenPaste/releases/tag/v0.2.1)
+需要 **macOS 14 或更新版本**。从最新发行页下载 macOS 通用 ZIP，解压后将 `GuziPaste.app` 放入「应用程序」。通用包包含 Apple Silicon 和 Intel 架构。 [下载最新版本](https://github.com/Drangon-Li/OpenPaste/releases/latest)
 
 从 v0.1.0 或上游 OpenPaste 换装时，先退出旧版并备份当前数据目录，保留旧应用副本以便回退，再将应用程序目录中的旧版移出、放入 GuziPaste。两者使用相同的应用标识和默认数据目录，GuziPaste 会继续读取现有历史、收藏及设置。
 
 安装包使用固定自签名证书，尚未经过 Apple Developer ID 签名和公证。首次打开若被 macOS 阻止，确认来源和校验值后，可在「系统设置 → 隐私与安全性」选择「仍要打开」。从临时签名版首次换装后，直接粘贴可能需要在「辅助功能」中重新授权 GuziPaste。 [Apple 打开说明](https://support.apple.com/zh-cn/102445)
 
-ZIP 同页提供 SHA-256 文件。下载两个文件到同一目录后，可运行 `shasum -a 256 -c GuziPaste-0.2.1-macos-universal.sha256` 核对。
+ZIP 同页提供对应的 SHA-256 文件。把两个文件下载到同一目录，将命令中的 `文件名.sha256` 换成下载的校验文件名，再运行 `shasum -a 256 -c 文件名.sha256` 核对。
 
 如需从源码构建，安装 **Xcode Command Line Tools** 后执行以下命令，首次构建会联网下载 Swift 依赖。
 
@@ -93,6 +93,8 @@ open build/GuziPaste.app
 首次运行时启用记录，按 **⌘⇧V** 呼出历史。快捷键可以在设置中录制，支持 **Command + 按键**，也支持 Control、Option 及组合修饰键；已有用户保留自己的配置。
 
 从 v0.2.1 起，可在「设置 → 通用 → 外观」选择是否显示菜单栏图标、切换跟随系统／浅色／深色外观，以及开启或关闭预览动画。隐藏菜单栏图标后，可用呼出快捷键进入面板，再从更多菜单打开设置。
+
+从 v0.2.2 起，隐私和软件更新入口可以直接打开对应的设置页。文字预览底部的字符、词和行数会在后台计算完成后显示，等待期间可以阅读正文、切换条目或关闭预览。
 
 在「设置 → 隐私与权限」点击「授权指引」，可将浮窗里的 GuziPaste 图标拖到系统辅助功能列表，并开启权限。浮窗会显示当前运行的应用位置和授权状态，也可在访达中定位应用。如果 macOS 从系统临时转移路径（App Translocation）运行 GuziPaste，指引会提示先将应用放入「应用程序」，再从那里重新打开。
 

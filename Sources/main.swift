@@ -728,7 +728,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         case .unavailable: showToast(store.recordingPauseControl.status)
         }
     }
-    @objc func openSettings() {
+    func openSettings(page: SettingsPage? = nil) {
         let finishTiming = AcceptanceMetrics.begin("settings.open"); defer { finishTiming() }
         rememberExternalTarget()
         settingsRequest += 1
@@ -750,13 +750,17 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             window.delegate = self
             finishWindow()
             let finishContent = AcceptanceMetrics.begin("settings.content")
-            let host = NSHostingView(rootView: SettingsView(store: store))
+            let initialPage = page ?? (CommandLine.arguments.contains("--about") ? .about : .general)
+            let selection = SettingsSelection(page: initialPage)
+            let host = NSHostingView(rootView: SettingsView(store: store, selection: selection))
             host.sizingOptions = []
             window.contentView = host
             finishContent()
             let visible = screen.visibleFrame
             window.setFrameOrigin(NSPoint(x: visible.midX - window.frame.width / 2, y: visible.midY - window.frame.height / 2))
             settingsWindow = window
+        } else if let page, let host = settingsWindow?.contentView as? NSHostingView<SettingsView> {
+            host.rootView.selection.page = page
         }
         let finishShow = AcceptanceMetrics.begin("settings.show")
         settingsWindow?.makeKeyAndOrderFront(nil)
@@ -784,17 +788,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         }
     }
     func openPrivacySettings() {
-        openSettings()
-        DispatchQueue.main.async { [weak self] in
-            guard self?.store.settings == true else { return }
-            NotificationCenter.default.post(name: SettingsView.privacyNotification, object: nil)
-        }
+        openSettings(page: .privacy)
     }
     @objc func checkUpdatesFromMenu() {
         guard !modalShowing else { return }
         if UpdateChecker.shared.available != nil { showUpdateDetails(); return }
-        openSettings()
-        NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
+        openSettings(page: .about)
         UpdateChecker.shared.check()
     }
     func presentLaunchUpdateWhenReady() {
@@ -817,8 +816,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         guard !modalShowing, let release = UpdateChecker.shared.available, let url = release.pageURL else { return }
         pendingLaunchUpdate = nil
         presentedUpdateTags.insert(release.tag_name)
-        openSettings()
-        NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
+        openSettings(page: .about)
         let installer = UpdateInstaller.shared
         let blocked = installer.blockingReason()
         let alert = NSAlert()
@@ -851,8 +849,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             return
         }
         guard let notice = UpdateNotice.consumePending() else { return }
-        openSettings()
-        NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
+        openSettings(page: .about)
         let alert = NSAlert()
         if notice.succeeded {
             alert.messageText = "GuziPaste 已更新到 \(notice.to)"
@@ -867,8 +864,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func promptInstallReady() {
         let installer = UpdateInstaller.shared
         guard installer.phase == .ready, let release = installer.preparedRelease, !modalShowing else { return }
-        openSettings()
-        NotificationCenter.default.post(name: UpdateChecker.aboutNotification, object: nil)
+        openSettings(page: .about)
         let alert = NSAlert()
         alert.messageText = "GuziPaste \(release.version) 已准备好"
         alert.informativeText = "新版已下载，SHA-256 与签名均已验证。现在重启并安装？重启后会自动重新打开，历史数据保留。"

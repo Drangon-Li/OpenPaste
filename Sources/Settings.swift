@@ -21,18 +21,25 @@ final class SettingsDirectoryInfo: ObservableObject {
         }
     }
 }
+final class SettingsSelection: ObservableObject {
+    @Published var page: SettingsPage
+
+    init(page: SettingsPage) { self.page = page }
+}
+
 struct SettingsView: View {
-    static let privacyNotification = Notification.Name("OpenPasteShowPrivacy")
     @ObservedObject var store: Store
+    @ObservedObject var selection: SettingsSelection
     @StateObject private var directory = SettingsDirectoryInfo()
-    @State private var page: SettingsPage = CommandLine.arguments.contains("--about") ? .about : .general
+
     var body: some View {
+        let page = selection.page
         HStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 24) {
                 HStack(spacing: 9) { Image(nsImage: NSApp.applicationIconImage).resizable().frame(width: 32, height: 32); VStack(alignment: .leading, spacing: 2) { Text("GuziPaste").font(.system(size: 15, weight: .semibold)); Text("本机剪贴板").font(.system(size: 11)).foregroundStyle(.secondary) } }.padding(.top, 8)
                 VStack(spacing: 5) {
                     ForEach(SettingsPage.allCases, id: \.self) { item in
-                        Button { Controller.shared.cancelShortcutRecording(); page = item } label: {
+                        Button { Controller.shared.cancelShortcutRecording(); selection.page = item } label: {
                             Label(item.rawValue, systemImage: item.icon).font(.system(size: 13, weight: page == item ? .medium : .regular)).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 10).padding(.vertical, 9)
                                 .foregroundStyle(page == item ? Color.white : Color.primary).background(page == item ? Color.accentColor : Color.clear, in: RoundedRectangle(cornerRadius: 8))
                                 .contentShape(Rectangle())
@@ -46,13 +53,11 @@ struct SettingsView: View {
                 }.buttonStyle(.bordered).controlSize(.small).help("退出程序并保存历史记录")
             }.padding(16).frame(width: 170).background(.regularMaterial)
             Divider()
-            SettingsPages(page: page, store: store, directory: directory)
+            SettingsPages(page: page, store: store, directory: directory, selection: selection)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }.frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear { directory.refresh(store.root) }
         .onChange(of: store.root) { _, root in directory.refresh(root) }
-        .onReceive(NotificationCenter.default.publisher(for: UpdateChecker.aboutNotification)) { _ in page = .about }
-        .onReceive(NotificationCenter.default.publisher(for: Self.privacyNotification)) { _ in page = .privacy }
     }
 }
 
@@ -60,13 +65,14 @@ struct SettingsView: View {
 func runSettingsPageCacheTests(store: Store) {
     let coordinator = SettingsPages.Coordinator()
     let directory = SettingsDirectoryInfo()
+    let selection = SettingsSelection(page: .general)
     let container = NSView(frame: NSRect(x: 0, y: 0, width: 570, height: 620))
     let passes = store.filterPasses
-    for page in SettingsPage.allCases { coordinator.show(page, in: container, store: store, directory: directory) }
+    for page in SettingsPage.allCases { coordinator.show(page, in: container, store: store, directory: directory, selection: selection) }
     let original = coordinator.hosts
     for _ in 0..<3 {
         for page in SettingsPage.allCases {
-            coordinator.show(page, in: container, store: store, directory: directory)
+            coordinator.show(page, in: container, store: store, directory: directory, selection: selection)
             guard coordinator.hosts[page] === original[page], container.subviews.count == 1 else { print("FAIL: settings page was rebuilt or left duplicate views"); exit(1) }
         }
     }
@@ -80,10 +86,11 @@ struct SettingsPages: NSViewRepresentable {
     let page: SettingsPage
     let store: Store
     let directory: SettingsDirectoryInfo
+    let selection: SettingsSelection
     final class Coordinator {
         private(set) var hosts: [SettingsPage: NSHostingView<SettingsPageView>] = [:]
         private var current: SettingsPage?
-        func show(_ page: SettingsPage, in container: NSView, store: Store, directory: SettingsDirectoryInfo) {
+        func show(_ page: SettingsPage, in container: NSView, store: Store, directory: SettingsDirectoryInfo, selection: SettingsSelection) {
             guard current != page else { return }
             let finishTiming = AcceptanceMetrics.begin("settings.page.\(page.rawValue)"); defer { finishTiming() }
             if let current { hosts[current]?.removeFromSuperview() }
@@ -91,7 +98,7 @@ struct SettingsPages: NSViewRepresentable {
             if let cached = hosts[page] { host = cached }
             else {
                 let finishHost = AcceptanceMetrics.begin("settings.host.\(page.rawValue)"); defer { finishHost() }
-                host = NSHostingView(rootView: SettingsPageView(store: store, directory: directory, page: page))
+                host = NSHostingView(rootView: SettingsPageView(store: store, directory: directory, page: page, selection: selection))
                 host.sizingOptions = []
                 host.autoresizingMask = [.width, .height]
                 hosts[page] = host
@@ -104,11 +111,11 @@ struct SettingsPages: NSViewRepresentable {
     func makeCoordinator() -> Coordinator { Coordinator() }
     func makeNSView(context: Context) -> NSView {
         let container = NSView()
-        context.coordinator.show(page, in: container, store: store, directory: directory)
+        context.coordinator.show(page, in: container, store: store, directory: directory, selection: selection)
         return container
     }
     func updateNSView(_ container: NSView, context: Context) {
-        context.coordinator.show(page, in: container, store: store, directory: directory)
+        context.coordinator.show(page, in: container, store: store, directory: directory, selection: selection)
     }
 }
 
@@ -116,6 +123,7 @@ struct SettingsPageView: View {
     @ObservedObject var store: Store
     @ObservedObject var directory: SettingsDirectoryInfo
     let page: SettingsPage
+    let selection: SettingsSelection
     @ObservedObject private var updates = UpdateChecker.shared
     @ObservedObject private var installer = UpdateInstaller.shared
     @ObservedObject private var analytics = UsageAnalytics.shared
@@ -147,12 +155,14 @@ struct SettingsPageView: View {
                     Spacer()
                 }.padding(24)
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 22) {
+                    Group {
                         switch page {
                         case .general: general
                         case .translation:
-                            group("翻译服务") { TranslationSettings(store: store, key: $translationKey) }
-                            HStack(alignment: .top, spacing: 9) { Image(systemName: "info.circle").foregroundStyle(.secondary); note("使用 OpenAI 兼容接口。开启后，选中文字会发送到你配置的服务；GuziPaste 不上传其他历史。") }
+                            VStack(alignment: .leading, spacing: 22) {
+                                group("翻译服务") { TranslationSettings(store: store, key: $translationKey) }
+                                HStack(alignment: .top, spacing: 9) { Image(systemName: "info.circle").foregroundStyle(.secondary); note("使用 OpenAI 兼容接口。开启后，选中文字会发送到你配置的服务；GuziPaste 不上传其他历史。") }
+                            }
                         case .privacy: privacy
                         case .data: data
                         case .about: about
@@ -213,7 +223,7 @@ struct SettingsPageView: View {
                 if analytics.available {
                     note("官方构建默认开启。GuziPaste 向 Google Firebase Analytics 记录首次启动、粘贴取用和翻译成功三项次数；首次启动用于估算安装量。Firebase SDK 还会处理应用实例标识、设备与应用版本等基础信息。")
                     note("不发送剪贴板内容、所选文字、网址、文件路径或翻译 API Key。可在「隐私与权限」关闭，关闭后停止收集并清除本机统计标识。")
-                    Button("管理使用统计…") { NotificationCenter.default.post(name: SettingsView.privacyNotification, object: nil) }.buttonStyle(.link)
+                    Button("管理使用统计…") { selection.page = .privacy }.buttonStyle(.link)
                 } else {
                     note("此构建未配置 Firebase，不会发送使用统计。")
                 }
@@ -249,7 +259,7 @@ struct SettingsPageView: View {
         }
     }
     private var general: some View {
-        VStack(alignment: .leading, spacing: 22) {
+        LazyVStack(alignment: .leading, spacing: 22) {
             group("启动") {
                 toggleRow("登录 Mac 时启动 GuziPaste", isOn: Binding(get: { login.enabled }, set: { login.setEnabled($0) }))
                     .disabled(login.changing || !login.available)
@@ -261,8 +271,6 @@ struct SettingsPageView: View {
                 if !login.available { note("隔离验收模式不登记系统登录项。") }
                 if !login.message.isEmpty { note(login.message) }
             }
-            .onAppear { login.refresh() }
-            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in login.refresh() }
             group("外观") {
                 toggleRow("显示菜单栏图标", isOn: $showMenuBarIcon)
                 note("隐藏后可按 \(store.shortcutLabel) 呼出，再从面板的更多菜单进入设置。")
@@ -283,8 +291,6 @@ struct SettingsPageView: View {
                 toggleRow("预览动画", isOn: $previewAnimationsEnabled)
                 note("关闭后，空格直接展开或收起预览。系统开启减少动态效果时也会直接切换。")
             }
-            .onChange(of: showMenuBarIcon) { _, _ in Controller.shared.applyMenuBarVisibility() }
-            .onChange(of: interfaceAppearance) { _, _ in Controller.shared.applyInterfaceAppearance() }
             group("键盘操作") {
                 HStack { Text("呼出剪贴板"); Spacer(); Text(store.recordingShortcut ? "请按组合键…" : store.shortcutLabel).font(.system(size: 12, weight: .medium, design: .monospaced)).padding(.horizontal, 10).padding(.vertical, 6).background(.quaternary, in: RoundedRectangle(cornerRadius: 6)); Button(store.recordingShortcut ? "取消" : "更改…") { Controller.shared.beginShortcutRecording() } }
                 HStack { note(store.shortcutNotice.isEmpty ? "使用 ⌘、⌃ 或 ⌥ 搭配一个按键，也可组合 ⇧。录制时按 Esc 取消。" : store.shortcutNotice); Spacer(); Button("恢复默认") { Controller.shared.cancelShortcutRecording(); Controller.shared.installShortcut(.standard, persist: true) }.buttonStyle(.link).font(.caption) }
@@ -331,6 +337,10 @@ struct SettingsPageView: View {
                 HStack { VStack(alignment: .leading, spacing: 4) { Text("图片文字识别"); note(store.ocrProgress.isEmpty ? "识别后的文字可在历史中搜索" : store.ocrProgress) }; Spacer(); Button(store.indexingImages ? "识别中…" : "识别历史图片") { store.indexImages() }.disabled(store.indexingImages) }
             }
         }
+        .onAppear { login.refresh() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in login.refresh() }
+        .onChange(of: showMenuBarIcon) { _, _ in Controller.shared.applyMenuBarVisibility() }
+        .onChange(of: interfaceAppearance) { _, _ in Controller.shared.applyInterfaceAppearance() }
     }
     private var privacy: some View {
         VStack(alignment: .leading, spacing: 22) {

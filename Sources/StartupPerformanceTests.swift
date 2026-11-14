@@ -2,6 +2,8 @@
 import AppKit
 import QuartzCore
 import Carbon
+import SwiftUI
+import Vision
 
 @MainActor
 private final class StartupPerformanceWindowDelegate: NSObject, NSWindowDelegate {
@@ -195,6 +197,16 @@ func runStartupPerformanceTests(controller: Controller) async {
     controller.showShelf()
     submit(panel)
     await drain()
+    if let clip = store.filtered.first {
+        for iteration in 0...5 {
+            await measure("preview.open", iteration: iteration, expectedFilterPasses: 0,
+                          window: { controller.previewWindow },
+                          verify: { controller.previewPopover?.isShown == true && controller.previewClipID == clip.id },
+                          action: { controller.showPreview(clip) })
+            controller.closePreview(animated: false)
+            await drain()
+        }
+    }
     for iteration in 0...5 {
         let expected = store.filtered[iteration + 1].id
         await measure("shelf.selection.visible", iteration: iteration, expectedFilterPasses: 0, expectedSelection: expected,
@@ -217,6 +229,207 @@ func runStartupPerformanceTests(controller: Controller) async {
         }
     }
     passed = passed && iconCacheReused
+
+    func settingsHosts(in view: NSView?) -> [NSHostingView<SettingsPageView>] {
+        guard let view else { return [] }
+        if let host = view as? NSHostingView<SettingsPageView> { return [host] }
+        return view.subviews.flatMap { settingsHosts(in: $0) }
+    }
+    let defaultPage: SettingsPage = CommandLine.arguments.contains("--about") ? .about : .general
+    let routes: [(SettingsPage, () -> Void)] = [
+        (defaultPage, { controller.openSettings() }),
+        (.privacy, { controller.openPrivacySettings() }),
+        (.about, { controller.openSettings(page: .about) })
+    ]
+    for (target, open) in routes {
+        controller.closeSettings()
+        controller.settingsWindow = nil
+        await drain()
+        open()
+        guard let window = controller.settingsWindow else {
+            passed = false
+            emit(["event": "settings.routing", "target": target.rawValue, "passed": false, "reason": "settings window missing"])
+            continue
+        }
+        window.ignoresMouseEvents = true
+        submit(window)
+        let firstHosts = settingsHosts(in: window.contentView)
+        let firstPageMatches = window.isVisible && firstHosts.count == 1 && firstHosts.first?.rootView.page == target
+
+        let alternate: SettingsPage = target == .general ? .privacy : .general
+        controller.openSettings(page: alternate)
+        await drain()
+        submit(window)
+        let alternateHosts = settingsHosts(in: window.contentView)
+        let warmPageMatches = controller.settingsWindow === window && alternateHosts.count == 1 && alternateHosts.first?.rootView.page == alternate
+
+        controller.closeSettings()
+        let closed = !window.isVisible && !store.settings
+        controller.openSettings()
+        await drain()
+        submit(window)
+        let reopenedHosts = settingsHosts(in: window.contentView)
+        let reopenRetainsPage = controller.settingsWindow === window && window.isVisible &&
+            reopenedHosts.count == 1 && reopenedHosts.first === alternateHosts.first
+
+        controller.closeSettings()
+        if target == .privacy { controller.openPrivacySettings() }
+        else { controller.openSettings(page: target) }
+        submit(window)
+        let returnedHosts = settingsHosts(in: window.contentView)
+        let targetedReopenRetainsHost = controller.settingsWindow === window && window.isVisible &&
+            returnedHosts.count == 1 && returnedHosts.first === firstHosts.first
+
+        controller.closeSettings()
+        controller.openSettings(page: alternate)
+        submit(window)
+        let alternateReopenHosts = settingsHosts(in: window.contentView)
+        let alternateReopenRetainsHost = controller.settingsWindow === window && window.isVisible &&
+            alternateReopenHosts.count == 1 && alternateReopenHosts.first === alternateHosts.first
+        let routePassed = firstPageMatches && warmPageMatches && closed && reopenRetainsPage &&
+            targetedReopenRetainsHost && alternateReopenRetainsHost
+        passed = passed && routePassed
+        emit(["event": "settings.routing", "target": target.rawValue,
+              "first_pages": firstHosts.map { $0.rootView.page.rawValue },
+              "warm_page": alternateHosts.first?.rootView.page.rawValue ?? "none",
+              "closed": closed, "reopen_retains_page": reopenRetainsPage,
+              "targeted_reopen_retains_host": targetedReopenRetainsHost,
+              "alternate_reopen_retains_host": alternateReopenRetainsHost, "passed": routePassed])
+    }
+
+    controller.closeSettings()
+    controller.settingsWindow = nil
+    await drain()
+    controller.openSettings(page: .about)
+    let rapidWindow = controller.settingsWindow
+    controller.openPrivacySettings()
+    if let rapidWindow { submit(rapidWindow) }
+    let immediatePages = settingsHosts(in: rapidWindow?.contentView).map { $0.rootView.page }
+    await drain()
+    if let rapidWindow { submit(rapidWindow) }
+    let settledPages = settingsHosts(in: rapidWindow?.contentView).map { $0.rootView.page }
+    let rapidRoutePassed = controller.settingsWindow === rapidWindow && rapidWindow?.isVisible == true &&
+        immediatePages == [.privacy] && settledPages == [.privacy]
+    passed = passed && rapidRoutePassed
+    emit(["event": "settings.routing.rapid", "first_pages": immediatePages.map(\.rawValue),
+          "settled_pages": settledPages.map(\.rawValue), "passed": rapidRoutePassed])
+
+    controller.closeSettings()
+
+    func normalizedSummary(_ text: String) -> String {
+        // Vision reads the rendered middle dot as a bullet; counts and labels stay exact.
+        String(text.filter { !$0.isWhitespace }).replacingOccurrences(of: "•", with: "·")
+    }
+
+    func waitForPreviewFooter(_ expected: String, stage: String) async -> String {
+        // A hosting view's first bitmap is transparent until SwiftUI commits a frame.
+        await drain()
+        let deadline = CACurrentMediaTime() + 2
+        var raw = ""
+        var lastImage: NSBitmapImageRep?
+        while CACurrentMediaTime() < deadline {
+            guard let window = controller.previewWindow, window.isVisible,
+                  let root = controller.previewHost?.view else { break }
+            submit(window)
+            guard let bitmap = root.bitmapImageRepForCachingDisplay(in: root.bounds) else { break }
+            root.cacheDisplay(in: root.bounds, to: bitmap)
+            lastImage = bitmap
+            let pixelScale = CGFloat(bitmap.pixelsHigh) / root.bounds.height
+            let footerHeight = min(bitmap.pixelsHigh, Int(ceil(PreviewLayout.footer * pixelScale)))
+            guard let image = bitmap.cgImage,
+                  let footer = image.cropping(to: CGRect(x: 0, y: bitmap.pixelsHigh - footerHeight,
+                                                         width: bitmap.pixelsWide, height: footerHeight)) else { break }
+            raw = await Task.detached(priority: .userInitiated) {
+                let request = VNRecognizeTextRequest()
+                request.recognitionLevel = .accurate
+                request.recognitionLanguages = ["zh-Hans", "en-US"]
+                request.usesLanguageCorrection = false
+                do {
+                    try VNImageRequestHandler(cgImage: footer).perform([request])
+                    return (request.results ?? []).compactMap { $0.topCandidates(1).first?.string }.joined(separator: " ")
+                } catch {
+                    return error.localizedDescription
+                }
+            }.value
+            if normalizedSummary(raw) == normalizedSummary(expected) { return raw }
+            await drain()
+        }
+
+        var diagnostic: [String: Any] = ["event": "preview.footer.diagnostics", "stage": stage, "ocr": raw]
+        if AppEnvironment.current.acceptanceMode,
+           let png = lastImage?.representation(using: .png, properties: [:]) {
+            let snapshot = AppEnvironment.current.defaultDataRoot.appendingPathComponent("preview-footer-\(stage).png")
+            do {
+                try FileManager.default.createDirectory(at: snapshot.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try png.write(to: snapshot, options: .atomic)
+                diagnostic["snapshot"] = snapshot.path
+            } catch {
+                diagnostic["snapshot_error"] = error.localizedDescription
+            }
+        }
+        emit(diagnostic)
+        return raw
+    }
+
+    func testPreviewFooter() async -> Bool {
+        func textClip(_ text: String) -> Clip {
+            Clip(source: "Preview footer fixture", sourceID: "", kind: "文字", title: "Preview footer fixture",
+                 text: text, parts: [[ClipPart(type: "public.utf8-plain-text", data: Data(text.utf8))]])
+        }
+        let long = textClip(String(repeating: "word\n", count: 40_000) + "tail")
+        let short = textClip("fresh\ntext")
+        let shortExpected = "10 个字符 · 2 个词 · 2 行"
+        let editedText = "edited three words"
+        let editedExpected = "18 个字符 · 3 个词 · 1 行"
+        store.resetFilters()
+        store.archive = Archive(clips: [long, short])
+        controller.showShelf()
+        store.choose(short.id)
+        submit(panel)
+        await drain()
+
+        controller.showPreview(short)
+        let initialSummary = await waitForPreviewFooter(shortExpected, stage: "initial")
+        controller.closePreview(animated: false)
+        guard normalizedSummary(initialSummary) == normalizedSummary(shortExpected) else {
+            emit(["event": "preview.footer", "stage": "initial", "ocr": initialSummary, "passed": false])
+            return false
+        }
+
+        store.choose(long.id)
+        controller.showPreview(long)
+        guard let window = controller.previewWindow, let popover = controller.previewPopover else {
+            emit(["event": "preview.footer", "stage": "open_long", "passed": false])
+            return false
+        }
+        window.ignoresMouseEvents = true
+        submit(window)
+        await drain()
+        store.choose(short.id)
+        let switchedSummary = await waitForPreviewFooter(shortExpected, stage: "after-switch")
+        let switchedInPlace = controller.previewPopover === popover && controller.previewWindow === window &&
+            controller.previewClipID == short.id && normalizedSummary(switchedSummary) == normalizedSummary(shortExpected)
+
+        let saved = store.saveContentEdit(.text(NSAttributedString(string: editedText)), to: .existing(short.id))
+        let editedSummary = await waitForPreviewFooter(editedExpected, stage: "after-edit")
+        let editedInPlace = saved && controller.previewPopover === popover && controller.previewWindow === window &&
+            controller.previewClipID == short.id && normalizedSummary(editedSummary) == normalizedSummary(editedExpected)
+
+        store.choose(long.id)
+        await drain()
+        controller.closePreview(animated: false)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        let closed = controller.previewPopover == nil && controller.previewHost == nil &&
+            controller.previewWindow == nil && controller.previewClipID == nil && !window.isVisible
+        let valid = switchedInPlace && editedInPlace && closed
+        emit(["event": "preview.footer", "initial": initialSummary, "after_switch": switchedSummary,
+              "after_edit": editedSummary, "switched_in_place": switchedInPlace, "edited_in_place": editedInPlace,
+              "closed": closed, "passed": valid])
+        return valid
+    }
+
+    let previewFooterPassed = await testPreviewFooter()
+    passed = passed && previewFooterPassed
     emit(["event": "summary", "passed": passed, "samples": samples,
           "icon_cache_reused": iconCacheReused,
           "boundary": "application submission only; no pixel presentation measurement"])

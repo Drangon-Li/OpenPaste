@@ -5,15 +5,23 @@ import NaturalLanguage
 
 /// Facts shown under a preview, e.g. "134 characters · 4 words · 10 lines".
 enum PreviewMetadata {
-    static func textSummary(_ text: String) -> String {
-        let sample = text.count > 200_000 ? String(text.prefix(200_000)) : text
+    static func textSummary(_ text: String) -> String? {
+        guard !Task.isCancelled else { return nil }
+        let count = text.count
+        if count == 0 { return "0 个字符 · 0 个词 · 0 行" }
+        let truncated = count > 200_000
+        let sample = truncated ? String(text.prefix(200_000)) : text
         var words = 0
         let tokenizer = NLTokenizer(unit: .word)
         tokenizer.string = sample
-        tokenizer.enumerateTokens(in: sample.startIndex..<sample.endIndex) { _, _ in words += 1; return true }
-        let lines = sample.isEmpty ? 0 : sample.components(separatedBy: "\n").count
-        let suffix = text.count > 200_000 ? "+" : ""
-        return "\(text.count) 个字符 · \(words)\(suffix) 个词 · \(lines)\(suffix) 行"
+        tokenizer.enumerateTokens(in: sample.startIndex..<sample.endIndex) { _, _ in
+            words += 1
+            return !Task.isCancelled
+        }
+        guard !Task.isCancelled else { return nil }
+        let lines = sample.components(separatedBy: "\n").count
+        let suffix = truncated ? "+" : ""
+        return "\(count) 个字符 · \(words)\(suffix) 个词 · \(lines)\(suffix) 行"
     }
     static func colorSummary(hex: String) -> String? {
         guard let color = CapturedColor.parse(hex)?.nsColor.usingColorSpace(.sRGB) else { return nil }
@@ -40,6 +48,32 @@ enum PreviewMetadata {
             return (width, height)
         }
         return nil
+    }
+}
+
+private struct PreviewTextSummary: View {
+    let text: String
+    @State private var summary: (text: String, value: String)?
+
+    var body: some View {
+        let value = summary?.text == text ? summary?.value : nil
+        Text(value ?? "0")
+            .lineLimit(1)
+            .opacity(value == nil ? 0 : 1)
+            .accessibilityHidden(value == nil)
+            .task(id: text) { [text] in
+                guard !Task.isCancelled else { return }
+                let computation = Task.detached(priority: .userInitiated) {
+                    PreviewMetadata.textSummary(text)
+                }
+                let result = await withTaskCancellationHandler {
+                    await computation.value
+                } onCancel: {
+                    computation.cancel()
+                }
+                guard !Task.isCancelled, let result else { return }
+                summary = (text, result)
+            }
     }
 }
 
@@ -182,7 +216,7 @@ struct FullItemPreview: View {
                 else if clip.kind == "链接" { Text(clip.text).lineLimit(1).truncationMode(.middle) }
                 else if clip.kind == "文件" { Text(clip.text.components(separatedBy: "\n").first ?? clip.text).lineLimit(1).truncationMode(.middle) }
                 else if let summary = PreviewMetadata.colorSummary(hex: clip.text) { Text(summary) }
-                else { Text(PreviewMetadata.textSummary(clip.text)) }
+                else { PreviewTextSummary(text: clip.text).id(clip.id) }
             }.font(.system(size: 13)).foregroundStyle(.secondary)
             Spacer()
             if clip.kind == "链接" || clip.kind == "文件" {
