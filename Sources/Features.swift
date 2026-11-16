@@ -429,7 +429,7 @@ extension Controller {
     /// until the field is first responder, then replayed so input methods compose normally.
     func beginTypeToSearch(_ event: NSEvent) {
         pendingSearchKeys.append(event)
-        store.searchFocused = true
+        store.focusShelfSearch()
         guard pendingSearchKeys.count == 1 else { return }
         pendingSearchAttempts = 0
         flushPendingSearchKeys()

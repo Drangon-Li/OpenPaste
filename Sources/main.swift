@@ -339,11 +339,9 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 return event
             }
             if event.keyCode == 53 {
-                if self.store.searchExpanded {
-                    self.store.resetFilters(preserveBoard: true); self.store.filtersExpanded = false
-                    self.store.searchFocused = false; self.store.searchExpanded = false
-                    self.panel.makeFirstResponder(self.panel.contentView)
-                } else { self.hideShelf() }
+                if self.store.filtersExpanded { self.store.filtersExpanded = false }
+                else if self.store.searchExpanded { self.closeShelfSearch() }
+                else { self.hideShelf() }
                 return nil
             }
             if event.keyCode == 51, [NSEvent.ModifierFlags.command, [.command, .shift]].contains(event.modifierFlags.intersection([.command, .option, .control, .shift])) {
@@ -375,11 +373,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                     if !event.isARepeat { self.showPreview(clip) }
                     return nil
                 }
-                if event.keyCode == 48 { self.store.searchFocused = true; return nil }
+                if event.keyCode == 48 { self.store.focusShelfSearch(); return nil }
                 if !event.modifierFlags.intersection([.command, .control, .option]).isEmpty { }
                 else if let chars = event.characters, !chars.isEmpty, chars.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }), ![36,49,123,124,125,126,48,53,51,117].contains(event.keyCode) { self.beginTypeToSearch(event); return nil }
             } else if event.keyCode == 48 || event.keyCode == 125 { self.store.searchFocused = false; self.panel.makeFirstResponder(self.panel.contentView); return nil }
-            if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { if self.store.searchExpanded { self.store.filtersExpanded.toggle() }; self.store.searchFocused = true; return nil }
+            if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { self.store.focusShelfSearch(); return nil }
             let quick = self.store.shelfShortcuts.quickPasteMatch(event.modifierFlags)
             if quick.matches, let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: quick.plain); return nil }
             if event.keyCode == 36 || event.keyCode == 76, let clip = self.store.filtered.first(where: { $0.id == self.store.selected }) ?? self.store.filtered.first {
@@ -611,11 +609,10 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         if TestMode.ui { target = NSRunningApplication.runningApplications(withBundleIdentifier: "io.github.SwallOwDili.OpenPaste.fixture").first }
         if TestMode.ui { print("UI show target: \(target?.bundleIdentifier ?? "none")"); fflush(stdout) }
         pasteGeneration += 1
-        store.resetFilters(); store.filtersExpanded = false
+        pendingSearchKeys.removeAll()
+        store.resetShelfSearch()
         if !preview, AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { store.capture(force: true) }
         refreshPermission()
-        store.searchFocused = false
-        store.searchExpanded = false
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main!
         let r = screen.frame
@@ -721,6 +718,11 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         } else {
             restoreShelfKeyboardFocus()
         }
+    }
+    func closeShelfSearch() {
+        pendingSearchKeys.removeAll()
+        store.resetShelfSearch(preserveBoard: true)
+        panel.makeFirstResponder(panel.contentView)
     }
     func hideShelf() {
         logInteraction("shelf.hide", reason: "explicit")
@@ -1452,11 +1454,16 @@ struct ShelfView: View {
     @State private var resizeStart: CGFloat?
     @State private var renderedClipCount = ShelfRenderWindow.batchSize
     @ObservedObject var store: Store
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @FocusState private var searchFocused: Bool
     /// Text typed in the field; committed to the store after a short pause so large
     /// histories are not re-filtered per keystroke or during input-method composition.
     @State private var draftQuery = ""
     @State private var queryCommit: DispatchWorkItem?
+    private var hasSearchFilters: Bool {
+        store.kind != "全部" || store.sourceFilter != "全部来源" || store.todayOnly || store.dateRangeEnabled
+    }
+
     var body: some View {
         let renderedClips = Array(store.filtered.prefix(renderedClipCount))
         VStack(spacing: 0) {
@@ -1465,19 +1472,24 @@ struct ShelfView: View {
                 .gesture(DragGesture().onChanged { value in if resizeStart == nil { resizeStart = Controller.shared.panel.frame.height }; Controller.shared.resizeShelf((resizeStart ?? ShelfLayout.defaultHeight) - value.translation.height) }.onEnded { _ in resizeStart = nil })
             HStack(spacing: 12) {
                 Spacer(minLength: 0)
-                if !store.searchExpanded {
-                Button { store.searchExpanded.toggle(); store.searchFocused = store.searchExpanded; if !store.searchExpanded { resetSearch() } } label: { Image(systemName: "magnifyingglass").font(.system(size: 15)).foregroundStyle(.secondary) }.buttonStyle(.plain).help("搜索 · ⌘F")
-                }
+                    .overlay(alignment: .leading) {
+                        Text(store.ocrProgress).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            .clipped().allowsHitTesting(false)
+                    }
+                searchControl
                 if store.searchExpanded {
-                HStack(spacing: 8) {
-                    Image(systemName: "magnifyingglass").foregroundStyle(searchFocused ? Color.blue : Color.secondary)
-                    TextField("搜索文字、链接或来源", text: $draftQuery).textFieldStyle(.plain).focused($searchFocused).frame(width: 250)
-                    if !draftQuery.isEmpty { Button { draftQuery = ""; store.query = ""; store.searchFocused = true } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }.buttonStyle(.plain).help("清空搜索") }
-                    else { Text("⌘F").font(.system(size: 10)).foregroundStyle(.tertiary) }
-                    Button { resetSearch(); store.searchExpanded = false; store.searchFocused = false; Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) } label: { Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.secondary) }.buttonStyle(.plain).help("退出搜索 · Esc")
-                }.padding(.horizontal, 12).padding(.vertical, 9)
-                    .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
-                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(searchFocused ? Color.blue.opacity(0.65) : Color.primary.opacity(0.1)))
+                    Button { store.filtersExpanded.toggle() } label: {
+                        Image(systemName: hasSearchFilters ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+                            .font(.system(size: 15))
+                            .foregroundStyle(hasSearchFilters ? Color.accentColor : Color.secondary)
+                            .frame(width: 24, height: 28).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("筛选历史")
+                    .accessibilityLabel("筛选历史")
+                    .accessibilityValue(hasSearchFilters ? "有筛选条件" : "未筛选")
+                    .popover(isPresented: $store.filtersExpanded, arrowEdge: .bottom) { searchFilters }
+                    .transition(.opacity)
                 }
                 tab("历史", icon: "clock.arrow.circlepath", active: store.board == nil) { store.board = nil }
                 ForEach(store.archive.boards) { board in
@@ -1528,36 +1540,11 @@ struct ShelfView: View {
                     Text("← → 选择 · ↵ 粘贴 · \(store.shelfShortcuts.quickPasteLabel) 快速粘贴")
                     Button("关闭 · Esc") { Controller.shared.hideShelf() }
                 } label: { Image(systemName: "ellipsis").font(.system(size: 16)).foregroundStyle(.secondary) }.menuStyle(.borderlessButton).fixedSize().help("更多")
-            }.padding(.horizontal, ShelfLayout.horizontalInset).padding(.vertical, 16)
-            if store.searchExpanded {
-            HStack(spacing: 12) {
-                ForEach(["全部", "文字", "链接", "图片", "文件", "颜色"], id: \.self) { kind in
-                    Button { store.kind = kind } label: { Text(kind).font(.system(size: 11, weight: .medium)).padding(.horizontal, 10).padding(.vertical, 5).foregroundStyle(store.kind == kind ? Color.white : Color.secondary).background(store.kind == kind ? Color.blue : Color.clear, in: Capsule()) }.buttonStyle(.plain)
-                }
-                Button { store.filtersExpanded.toggle() } label: { Image(systemName: "line.3.horizontal.decrease.circle") }.buttonStyle(.plain).popover(isPresented: $store.filtersExpanded) {
-                    VStack(alignment: .leading, spacing: 12) {
-                        Text("筛选历史").font(.headline)
-                        Picker("来源", selection: $store.sourceFilter) { Text("全部来源").tag("全部来源"); ForEach(store.sources, id: \.self) { Text($0).tag($0) } }
-                        Toggle("按日期范围", isOn: $store.dateRangeEnabled)
-                        if store.dateRangeEnabled { DatePicker("开始", selection: $store.startDate, displayedComponents: .date); DatePicker("结束", selection: $store.endDate, in: store.startDate..., displayedComponents: .date) }
-                        Button("清除筛选") { resetSearch(); store.dateRangeEnabled = false }
-                    }.padding(20).frame(width: 300)
-                }
-                Divider().frame(height: 12)
-                Menu { Button("全部来源") { store.sourceFilter = "全部来源" }; ForEach(store.sources, id: \.self) { source in Button(source) { store.sourceFilter = source } } } label: { Label(store.sourceFilter, systemImage: "line.3.horizontal.decrease") }.menuStyle(.borderlessButton).fixedSize().font(.system(size: 12))
-                Button { store.todayOnly.toggle() } label: { Label("今天", systemImage: "calendar").foregroundStyle(store.todayOnly ? Color.blue : Color.secondary) }.buttonStyle(.plain).font(.system(size: 12))
-                Spacer()
-                Text(store.paused ? store.recordingPauseControl.status : (store.query.isEmpty ? "\(store.filtered.count) 条历史" : "找到 \(store.filtered.count) 条结果")).font(.system(size: 12)).foregroundStyle(store.paused ? .orange : .secondary)
-            }.padding(.horizontal, ShelfLayout.horizontalInset).padding(.vertical, ShelfLayout.verticalInset)
             }
-            if store.searchExpanded && !store.query.isEmpty {
-                HStack(spacing: 8) {
-                    ForEach(Array(store.sources.filter { $0.localizedCaseInsensitiveContains(store.query) }.prefix(3)), id: \.self) { source in Button("应用：" + source) { store.sourceFilter = source; store.query = "" }.buttonStyle(.bordered).controlSize(.small) }
-                    if ["今天", "本周", "本月"].contains(store.query) { Button("日期：" + store.query) { let days = store.query == "今天" ? 0 : (store.query == "本周" ? 7 : 30); store.startDate = Date().addingTimeInterval(-Double(days * 86400)); store.endDate = Date(); store.dateRangeEnabled = true; store.query = "" }.buttonStyle(.bordered).controlSize(.small) }
-                }.padding(.horizontal, 20)
-            }
+            .padding(.horizontal, ShelfLayout.horizontalInset)
+            .frame(height: 60)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.20), value: store.searchExpanded)
             if !store.pasteQueue.isEmpty { HStack { Text("粘贴队列剩余 \(store.pasteQueue.count) 条"); Button("下一条 · ⌘↵") { Controller.shared.pasteNext() }; Button("结束") { store.pasteQueue.removeAll() } }.font(.caption) }
-            if !store.ocrProgress.isEmpty { Text(store.ocrProgress).font(.caption).foregroundStyle(.secondary) }
             if !store.captureNotice.isEmpty { Text(store.captureNotice).font(.system(size: 12)).foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 4) }
             if store.filtered.isEmpty {
                 VStack(spacing: 10) { Image(systemName: store.query.isEmpty ? "doc.on.clipboard" : "magnifyingglass").font(.system(size: 35)).foregroundStyle(.tertiary); Text(store.query.isEmpty ? "复制一些内容，它们会出现在这里" : "没有找到“\(store.query)”").foregroundStyle(.secondary); Text(store.query.isEmpty ? "\(store.shortcutLabel) 随时打开 · 所有数据保存在本机" : "搜索文字、链接和来源应用；图片文字将在后台识别后加入搜索").font(.system(size: 12)).foregroundStyle(.tertiary) }.frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1604,10 +1591,11 @@ struct ShelfView: View {
         }
         .onChange(of: draftQuery) { _, value in
             queryCommit?.cancel()
-            guard value != store.query else { return }
+            guard store.searchExpanded, value != store.query else { return }
             if value.isEmpty { store.query = value; return }
+            let resetCount = store.searchResetCount
             let work = DispatchWorkItem { [weak store] in
-                guard let store else { return }
+                guard let store, store.searchExpanded, store.searchResetCount == resetCount else { return }
                 // Wait until the input method has committed its marked text.
                 if let editor = Controller.shared?.panel.firstResponder as? NSTextView, editor.hasMarkedText() { return }
                 store.query = value
@@ -1623,11 +1611,128 @@ struct ShelfView: View {
         .onChange(of: store.endDate) { resetRenderWindow() }
         .onChange(of: store.todayOnly) { resetRenderWindow() }
         .onChange(of: store.reverseHistory) { resetRenderWindow() }
-        .onChange(of: store.searchFocused) { _, focused in
-            if focused { store.searchExpanded = true; DispatchQueue.main.async { searchFocused = true } } else { searchFocused = false; if store.query.isEmpty && store.kind == "全部" && store.sourceFilter == "全部来源" && !store.todayOnly { store.searchExpanded = false } }
+        .onChange(of: store.searchResetCount) {
+            queryCommit?.cancel()
+            draftQuery = store.query
         }
+        .onChange(of: store.searchFocusRequest) { _, request in
+            let panel = Controller.shared?.panel
+            if !(panel?.firstResponder is NSTextView) { searchFocused = false }
+            DispatchQueue.main.async {
+                guard store.searchExpanded, store.searchFocusRequest == request, panel?.isKeyWindow == true else { return }
+                searchFocused = true
+            }
+        }
+        .onChange(of: store.searchFocused) { _, focused in if !focused { searchFocused = false } }
         .onChange(of: searchFocused) { _, focused in if store.searchFocused != focused { store.searchFocused = focused } }
 
+    }
+    private var searchControl: some View {
+        let expanded = store.searchExpanded
+        let shape = RoundedRectangle(cornerRadius: 8)
+        return HStack(spacing: 6) {
+            Button { store.focusShelfSearch() } label: {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 15))
+                    .foregroundStyle(searchFocused ? Color.accentColor : Color.secondary)
+                    .frame(width: 17, height: 28).contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("搜索 · ⌘F")
+            .accessibilityLabel("搜索")
+
+            if expanded {
+                HStack(spacing: 6) {
+                    TextField("搜索历史", text: $draftQuery)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 13))
+                        .focused($searchFocused)
+                        .help("搜索文字、链接或来源")
+                    Button {
+                        clearSearchQuery()
+                        store.focusShelfSearch()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("清空搜索")
+                    .accessibilityLabel("清空搜索")
+                    .opacity(draftQuery.isEmpty ? 0 : 1)
+                    .disabled(draftQuery.isEmpty)
+                    .accessibilityHidden(draftQuery.isEmpty)
+                    Button { Controller.shared.closeShelfSearch() } label: {
+                        Image(systemName: "xmark").font(.system(size: 10)).foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("退出搜索 · Esc")
+                    .accessibilityLabel("退出搜索")
+                }
+                .transition(.opacity)
+            }
+        }
+        .padding(.horizontal, expanded ? 8 : 3)
+        .frame(width: expanded ? 164 : 23, height: 28, alignment: .leading)
+        .background { shape.fill(Color(nsColor: .controlBackgroundColor)).opacity(expanded ? 1 : 0) }
+        .overlay { shape.strokeBorder(searchFocused ? Color.accentColor.opacity(0.65) : Color.primary.opacity(0.1)).opacity(expanded ? 1 : 0).allowsHitTesting(false) }
+        .clipped()
+    }
+
+    private var searchFilters: some View {
+        let suggestedSources = store.query.isEmpty ? [] : store.sources.filter { $0.localizedCaseInsensitiveContains(store.query) }.prefix(3)
+        let suggestedDays = ["今天": 0, "本周": 7, "本月": 30][store.query]
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("筛选历史").font(.headline)
+                Spacer()
+                Text("\(store.filtered.count) 条结果").font(.caption).foregroundStyle(.secondary)
+            }
+            Picker("类型", selection: $store.kind) {
+                ForEach(["全部", "文字", "链接", "图片", "文件", "颜色"], id: \.self) { Text($0).tag($0) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            Picker("来源", selection: $store.sourceFilter) {
+                Text("全部来源").tag("全部来源")
+                ForEach(store.sources, id: \.self) { Text($0).tag($0) }
+            }
+            Toggle("仅今天", isOn: $store.todayOnly)
+            Toggle("按日期范围", isOn: $store.dateRangeEnabled)
+            if store.dateRangeEnabled {
+                DatePicker("开始", selection: $store.startDate, in: ...store.endDate, displayedComponents: .date)
+                DatePicker("结束", selection: $store.endDate, in: store.startDate..., displayedComponents: .date)
+            }
+            ForEach(Array(suggestedSources), id: \.self) { source in
+                Button("应用：" + source) {
+                    store.sourceFilter = source
+                    clearSearchQuery()
+                }
+            }
+            if let days = suggestedDays {
+                Button("日期：" + store.query) {
+                    let today = Date()
+                    store.startDate = today.addingTimeInterval(-Double(days * 86400))
+                    store.endDate = today
+                    store.dateRangeEnabled = true
+                    clearSearchQuery()
+                }
+            }
+            if store.paused {
+                Text(store.recordingPauseControl.status).font(.caption).foregroundStyle(.orange)
+            }
+            Button("清除搜索与筛选") {
+                clearSearchQuery()
+                store.resetFilters(preserveBoard: true)
+            }
+            .disabled(!hasSearchFilters && draftQuery.isEmpty)
+        }
+        .padding(16)
+        .frame(width: 304)
+    }
+
+    private func clearSearchQuery() {
+        queryCommit?.cancel()
+        draftQuery = ""
+        store.query = ""
     }
     func growRenderWindow() {
         let next = ShelfRenderWindow.nextCount(current: renderedClipCount, total: store.filtered.count)
@@ -1648,7 +1753,6 @@ struct ShelfView: View {
             proxy.scrollTo(id)
         }
     }
-    func resetSearch() { store.resetFilters(preserveBoard: true, preserveDateRange: true) }
     func tab(_ name: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) { Label(name, systemImage: icon).font(.system(size: 13, weight: .medium)).padding(.horizontal, 10).padding(.vertical, 6).background(active ? Color.primary.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 8)).foregroundStyle(Color.primary) }.buttonStyle(.plain)
     }
