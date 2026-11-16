@@ -176,6 +176,8 @@ final class Store: ObservableObject {
     @Published var permissionStatus = "未授权"
     @Published var searchFocused = false
     @Published var searchExpanded = false
+    @Published private(set) var searchFocusRequest = 0
+    @Published private(set) var searchResetCount = 0
     @Published var pasteQueue: [UUID] = []
     @Published var selection = Set<UUID>()
     @Published var compact = false
@@ -384,6 +386,19 @@ final class Store: ObservableObject {
     var filtered: [Clip] { visibleClips }
     func visibleIndex(of id: UUID) -> Int? { visibleIndexByID[id] }
     var sources: [String] { sourceNames }
+    func focusShelfSearch() {
+        if !searchExpanded { searchExpanded = true }
+        searchFocusRequest += 1
+    }
+    func resetShelfSearch(preserveBoard: Bool = false) {
+        if searchExpanded {
+            searchExpanded = false
+            searchResetCount += 1
+        }
+        filtersExpanded = false
+        searchFocused = false
+        resetFilters(preserveBoard: preserveBoard)
+    }
     private func filterValueChanged() {
         if batchingFilterChanges { filterRefreshPending = true }
         else { refreshResults() }
