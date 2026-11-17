@@ -686,6 +686,20 @@ func runPreviewToggleTests(controller: Controller) async {
     await settle(false)
     check(!panel.isVisible, "late callbacks leave shelf hidden")
 
+    await reset("outside-click-with-preview-open")
+    toggleAndCheck(open: true)
+    await settle(true)
+    controller.dismissShelfForExternalInteraction(reason: .outsideClick)
+    verifyOpen(false, "outside click closes the open preview immediately")
+    check(!panel.isVisible, "outside click hides the shelf")
+    await settle(false)
+
+    await reverseOpen("outside-click-during-reverse")
+    controller.dismissShelfForExternalInteraction(reason: .outsideClick)
+    verifyOpen(false, "outside click closes the reopening preview immediately")
+    await settle(false)
+    check(!panel.isVisible, "late callbacks leave the shelf hidden after an outside click")
+
     await reset("editor-during-close")
     toggleAndCheck(open: true)
     toggleAndCheck(open: false)

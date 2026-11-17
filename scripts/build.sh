@@ -57,7 +57,10 @@ cat > build/GuziPaste.app/Contents/Info.plist <<'PLIST'
 <key>FirebaseAppDelegateProxyEnabled</key><false/>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSAppTransportSecurity</key><dict><key>NSAllowsArbitraryLoads</key><true/></dict>
-<key>UTExportedTypeDeclarations</key><array><dict><key>UTTypeIdentifier</key><string>io.github.SwallOwDili.OpenPaste.clip-id</string><key>UTTypeConformsTo</key><array><string>public.data</string></array><key>UTTypeDescription</key><string>OpenPaste item reference</string></dict></array>
+<key>UTExportedTypeDeclarations</key><array>
+<dict><key>UTTypeIdentifier</key><string>io.github.SwallOwDili.OpenPaste.clip-id</string><key>UTTypeConformsTo</key><array><string>public.data</string></array><key>UTTypeDescription</key><string>OpenPaste item reference</string></dict>
+<dict><key>UTTypeIdentifier</key><string>io.github.SwallOwDili.OpenPaste.board-id</string><key>UTTypeConformsTo</key><array><string>public.data</string></array><key>UTTypeDescription</key><string>OpenPaste board reference</string></dict>
+</array>
 </dict></plist>
 PLIST
 python3 scripts/version.py --plist build/GuziPaste.app/Contents/Info.plist

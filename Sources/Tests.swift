@@ -258,6 +258,7 @@ func runNavigationTests() {
     boardStore.renameBoard(boardID, to: "  New name ")
     boardStore.renameBoard(boardID, to: "   ")
     guard boardStore.archive.boards[0].name == "New name" else { print("FAIL: board rename"); exit(1) }
+    runBoardInteractionTests()
     print("PASS: board cycling, preview paging, wheel conversion, label search and colour choices")
     let red = NSAttributedString(string: "Styled", attributes: [.foregroundColor: NSColor.red, .font: NSFont.boldSystemFont(ofSize: 24)])
     let plainAttributed = NSAttributedString(string: "Plain", attributes: [.foregroundColor: NSColor.black, .font: NSFont.systemFont(ofSize: 12)])
@@ -341,6 +342,119 @@ func runNavigationTests() {
     let whiteOnly = NSImage(size: NSSize(width: 32, height: 32), flipped: false) { rect in NSColor.white.setFill(); rect.fill(); return true }
     guard let light = IconAccent.dominant(of: whiteOnly)?.usingColorSpace(.sRGB), light.redComponent <= 0.63 else { print("FAIL: light icons must be darkened for white text"); exit(1) }
     print("PASS: card header takes the source icon's dominant colour")
+}
+
+private func runBoardInteractionTests() {
+    func check(_ condition: Bool, _ name: String) {
+        guard condition else { print("FAIL: \(name)"); exit(1) }
+        print("PASS: \(name)")
+    }
+    let a = Board(name: "A"), b = Board(name: "Board B"), c = Board(name: "C")
+    let entries = [[a.id], [a.id, b.id], [a.id, c.id]].enumerated().map { index, memberships in
+        Clip(source: "Fixture", sourceID: "fixture", kind: "文字", title: "Clip \(index)", text: "Clip \(index)", parts: [], boards: memberships)
+    }
+    let store = Store(ephemeral: true)
+    store.archive = Archive(clips: entries, boards: [a, b, c])
+    store.selectBoard(a.id)
+    let firstSelection = store.selected
+    let reorderPasses = store.filterPasses
+    store.moveBoard(a.id, to: c.id)
+    check(store.orderedBoards.map(\.id) == [b.id, c.id, a.id] && store.archive.boards == [a, b, c]
+          && store.selected == firstSelection && store.board == a.id && store.filterPasses == reorderPasses,
+          "moving a board only changes the displayed order")
+    store.moveBoard(a.id, to: b.id)
+    store.moveBoard(b.id, to: b.id)
+    store.moveBoard(UUID(), to: b.id)
+    check(store.orderedBoards.map(\.id) == [a.id, b.id, c.id] && store.filterPasses == reorderPasses,
+          "both directions work and stale or same-board reorders are ignored")
+    let extra = Board(name: "New board")
+    var updatedB = b
+    updatedB.color = "蓝色"
+    store.installSyncedSnapshot(DataDirectory.baseline(Archive(clips: entries, boards: [extra, c, updatedB, a])), updateArchive: true)
+    check(store.orderedBoards == [a, updatedB, c, extra], "sync refresh preserves display order and appends new boards")
+    store.addBoard("Later board")
+    let later = store.archive.boards.last!
+    let shuffled = DataDirectory.baseline(Archive(clips: entries, boards: [later, c, updatedB, a, extra]))
+    store.installSyncedSnapshot(shuffled, updateArchive: true)
+    check(store.orderedBoards == [a, updatedB, c, extra, later], "a later sync refresh preserves the order of two new boards")
+
+    let suite = "OpenPaste.favorite-board-order.\(UUID())"
+    let preferences = UserDefaults(suiteName: suite)!
+    let directory = FileManager.default.temporaryDirectory.appendingPathComponent(suite, isDirectory: true)
+    defer {
+        preferences.removePersistentDomain(forName: suite)
+        try? FileManager.default.removeItem(at: directory)
+    }
+    preferences.set(directory.path, forKey: "dataDirectory")
+    let saved = Store(defaults: preferences)
+    saved.archive.boards = [a, b, c]
+    saved.installSyncedSnapshot(DataDirectory.baseline(Archive(boards: [c, b, a])), updateArchive: true)
+    check(saved.orderedBoards == [a, b, c], "sync refresh preserves board order before the first manual reorder")
+    saved.moveBoard(c.id, to: a.id)
+    try! HistoryStorage.write(saved.archive, to: directory.appendingPathComponent("history.json"))
+    let reopened = Store(defaults: UserDefaults(suiteName: suite)!)
+    check(reopened.orderedBoards == [c, a, b], "a fresh Store reads the saved local board order")
+
+    func drop(_ reference: UUID, type: String = ShelfDrag.clipType, to board: UUID) {
+        guard let drag = store.takeShelfDrag(type: type) else { return }
+        store.completeShelfDrag(drag, reference: reference, to: board)
+    }
+    let beforeDrop = store.filterPasses
+    let sameBoard = store.beginShelfDrag(.clips(entries.map(\.id), sourceBoard: a.id))
+    drop(sameBoard, to: a.id)
+    let missingBoard = store.beginShelfDrag(.clips(entries.map(\.id), sourceBoard: a.id))
+    drop(missingBoard, to: UUID())
+    check(store.filterPasses == beforeDrop && store.undoItems.isEmpty, "same-board and missing-target drops do nothing")
+    let oldDrag = store.beginShelfDrag(.clips([entries[0].id], sourceBoard: nil))
+    _ = store.beginShelfDrag(.clips(entries.map(\.id), sourceBoard: a.id))
+    drop(entries[0].id, to: b.id)
+    _ = store.beginShelfDrag(.clips(entries.map(\.id), sourceBoard: a.id))
+    drop(oldDrag, to: b.id)
+    let move = store.beginShelfDrag(.clips(entries.map(\.id), sourceBoard: a.id))
+    drop(move, type: ShelfDrag.boardType, to: b.id)
+    check(store.filterPasses == beforeDrop && store.undoItems.isEmpty, "a bare card ID, earlier drag, and wrong type cannot add a favorite")
+    drop(move, to: b.id)
+    check(store.archive.clips.map { Set($0.boards) } == [Set([b.id]), Set([b.id]), Set([b.id, c.id])]
+          && store.archive.clips.map(\.id) == entries.map(\.id) && store.filtered.isEmpty && store.selected == nil
+          && store.filterPasses == beforeDrop + 1 && store.undoItems.count == 1,
+          "one batch moves out of A and keeps prior B and C memberships")
+    store.archive.clips[0].text = "Updated elsewhere"
+    store.undoItemChange()
+    check(store.archive.clips.map { Set($0.boards) } == entries.map { Set($0.boards) }
+          && store.archive.clips[0].text == "Updated elsewhere" && store.selectedClips.count == 3,
+          "undo restores only moved memberships and selects the visible clips")
+    drop(move, to: b.id)
+    check(store.archive.clips.map { Set($0.boards) } == entries.map { Set($0.boards) } && store.undoItems.isEmpty,
+          "a duplicate callback cannot repeat a move after undo")
+
+    store.selectBoard(nil)
+    let copy = store.beginShelfDrag(.clips([entries[0].id], sourceBoard: nil))
+    drop(copy, to: b.id)
+    store.selectBoard(b.id)
+    store.choose(entries[0].id)
+    store.deleteChosen()
+    check(store.archive.clips.first?.boards == [a.id] && store.archive.clips.count == entries.count,
+          "history drop adds membership and deleting inside B only removes it")
+    store.selectBoard(c.id)
+    store.undoItemChange()
+    check(store.archive.clips.first?.boards == [a.id, b.id] && store.selected == entries[2].id
+          && store.selectedClips.map(\.id) == [entries[2].id], "undo in another board keeps a visible selection")
+    let stale = store.beginShelfDrag(.clips([entries[0].id], sourceBoard: nil))
+    let staleDrop = store.takeShelfDrag(type: ShelfDrag.clipType)!
+    store.invalidatePendingStorageCallbacks()
+    let beforeStaleDrop = store.filterPasses
+    store.completeShelfDrag(staleDrop, reference: stale, to: c.id)
+    check(store.filterPasses == beforeStaleDrop, "a delayed drop from an old directory is ignored")
+
+    let retention = Store(ephemeral: true)
+    retention.retentionDays = 1
+    var old = entries[0]
+    old.created = Date.distantPast
+    retention.archive = Archive(clips: [old], boards: [a])
+    retention.selectBoard(a.id)
+    retention.removeBoard(a.id)
+    check(retention.board == nil && retention.archive.clips.map(\.id) == [old.id] && retention.archive.clips[0].boards.isEmpty,
+          "deleting a board preserves even expired content immediately")
 }
 
 func fixtureImage() -> Clip {
@@ -653,7 +767,7 @@ func runDragProviderTests() {
     let provider = idClip.dragProvider()
     var completed = false
     var identifier: String?
-    provider.loadDataRepresentation(forTypeIdentifier: "io.github.SwallOwDili.OpenPaste.clip-id") { data, error in
+    provider.loadDataRepresentation(forTypeIdentifier: ShelfDrag.clipType) { data, error in
         identifier = data.flatMap { String(data: $0, encoding: .utf8) }; completed = true
         if let error { print("Provider error: \(error.localizedDescription)") }
     }
@@ -661,6 +775,34 @@ func runDragProviderTests() {
     while !completed && Date() < until { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
     guard completed, identifier == idClip.id.uuidString else { print("FAIL: image drag does not preserve item identifier"); exit(1) }
     print("PASS: image drag resolves original item identifier")
+    let source = Board(name: "Drag source"), target = Board(name: "Drag target")
+    var draggedPNG = png, draggedJPEG = jpeg
+    draggedPNG.boards = [source.id]; draggedJPEG.boards = [source.id, target.id]
+    let dragStore = Store(ephemeral: true)
+    dragStore.archive = Archive(clips: [draggedPNG, draggedJPEG], boards: [source, target])
+    dragStore.selectBoard(source.id)
+    let reference = dragStore.beginShelfDrag(.clips([png.id, jpeg.id], sourceBoard: source.id))
+    let selectionProvider = draggedPNG.dragProvider(shelfReference: reference)
+    var selectionLoaded = false
+    var loadedReference: UUID?
+    selectionProvider.loadDataRepresentation(forTypeIdentifier: ShelfDrag.clipType) { data, _ in
+        loadedReference = data.flatMap { UUID(uuidString: String(decoding: $0, as: UTF8.self)) }
+        selectionLoaded = true
+    }
+    let selectionDeadline = Date().addingTimeInterval(5)
+    while !selectionLoaded && Date() < selectionDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+    guard selectionLoaded, let loadedReference, loadedReference == reference,
+          selectionProvider.registeredTypeIdentifiers.contains("public.png") else {
+        print("FAIL: shelf provider did not preserve the drag reference and native image format"); exit(1)
+    }
+    guard let accepted = dragStore.takeShelfDrag(type: ShelfDrag.clipType) else {
+        print("FAIL: current shelf drag unavailable at drop"); exit(1)
+    }
+    dragStore.completeShelfDrag(accepted, reference: loadedReference, to: target.id)
+    guard dragStore.filtered.isEmpty, dragStore.archive.clips.allSatisfy({ $0.boards == [target.id] }) else {
+        print("FAIL: provider drop left the dragged selection in the source board"); exit(1)
+    }
+    print("PASS: reading only clip-id moves the entire selection out of the source board")
     let invalid = imageClip("public.png", Data("not an image".utf8), "Invalid fixture").dragProvider()
     guard invalid.suggestedName?.hasSuffix(".png") != true && !invalid.registeredTypeIdentifiers.contains("public.png") else { print("FAIL: invalid image advertised as PNG"); exit(1) }
     print("PASS: PNG, JPEG, and TIFF drag files preserve bytes, type, and extension; invalid bytes are not advertised as PNG")
