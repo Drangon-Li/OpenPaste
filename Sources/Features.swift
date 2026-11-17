@@ -24,7 +24,39 @@ struct CapturedColor {
         return CapturedColor(hex: "#" + value.replacingOccurrences(of: "#", with: "").uppercased())
     }
 }
-struct ItemUndo { var clips: [Clip]; var ids: Set<UUID>; var label: String }
+struct BoardMembershipChange {
+    let id: UUID
+    let removed: UUID?
+    let added: UUID?
+}
+
+struct ItemUndo {
+    var clips: [Clip]
+    var ids: Set<UUID>
+    var label: String
+    var boardChanges: [BoardMembershipChange] = []
+}
+
+struct ShelfDrag {
+    static let boardType = "io.github.SwallOwDili.OpenPaste.board-id"
+    static let clipType = "io.github.SwallOwDili.OpenPaste.clip-id"
+
+    enum Contents {
+        case board(UUID)
+        case clips([UUID], sourceBoard: UUID?)
+    }
+
+    let reference = UUID()
+    let contents: Contents
+    let storageGeneration: Int
+
+    var type: String {
+        switch contents {
+        case .board: return Self.boardType
+        case .clips: return Self.clipType
+        }
+    }
+}
 extension Store {
     func enrichLink(_ clip: Clip) {
         LinkPreviewCache.shared.load(clip.text) { [weak self] result in
@@ -43,21 +75,111 @@ extension Store {
             selection = Set(filtered[min(a,b)...max(a,b)].map(\.id)); selected = id
         } else { selected = id; selection = [id]; selectionAnchor = id }
     }
-    func remember(_ clips: [Clip], label: String) { undoItems.append(ItemUndo(clips: clips, ids: Set(clips.map(\.id)), label: label)); if undoItems.count > 10 { undoItems.removeFirst() } }
+    private func appendUndo(_ undo: ItemUndo) {
+        undoItems.append(undo)
+        if undoItems.count > 10 { undoItems.removeFirst() }
+    }
+    func remember(_ clips: [Clip], label: String) {
+        appendUndo(ItemUndo(clips: clips, ids: Set(clips.map(\.id)), label: label))
+    }
     func undoItemChange() {
         guard canModifyHistory else { return }
         guard let undo = undoItems.popLast() else { return }
-        archive.clips.removeAll { undo.ids.contains($0.id) }
-        archive.clips.append(contentsOf: undo.clips); archive.clips.sort { $0.created > $1.created }
-        if let id = deletedCurrentID, undo.ids.contains(id), deletedCurrentChange == change { currentClipID = id }
-        selected = undo.clips.first?.id; selection = undo.ids; save(); message = "已撤销\(undo.label)"
+        let liveBoards = Set(archive.boards.map(\.id))
+        var updated = archive
+        if undo.boardChanges.isEmpty {
+            updated.clips.removeAll { undo.ids.contains($0.id) }
+            updated.clips.append(contentsOf: undo.clips.map { clip in
+                var restored = clip
+                restored.boards = clip.boards.filter { liveBoards.contains($0) }
+                return restored
+            })
+            updated.clips.sort { $0.created > $1.created }
+            if let id = deletedCurrentID, undo.ids.contains(id), deletedCurrentChange == change { currentClipID = id }
+        } else {
+            let changes = Dictionary(undo.boardChanges.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for index in updated.clips.indices {
+                guard let membership = changes[updated.clips[index].id] else { continue }
+                if let added = membership.added { updated.clips[index].boards.removeAll { $0 == added } }
+                if let removed = membership.removed, liveBoards.contains(removed), !updated.clips[index].boards.contains(removed) {
+                    updated.clips[index].boards.append(removed)
+                }
+            }
+        }
+        archive = updated
+        let visible = filtered.filter { undo.ids.contains($0.id) }
+        if let first = visible.first {
+            selected = first.id
+            selection = Set(visible.map(\.id))
+            selectionAnchor = first.id
+        }
+        save()
+        message = "已撤销\(undo.label)"
     }
     func replace(_ clip: Clip, label: String) {
         guard canModifyHistory else { message = historyModificationNotice; return }
         guard let i = archive.clips.firstIndex(where: { $0.id == clip.id }), clip.byteCount <= 20 * 1024 * 1024 else { message = "内容超过单条 20 MB 上限"; return }
         remember([archive.clips[i]], label: label); var updated = clip; updated.cachedDigest = updated.fingerprint; archive.clips[i] = updated; save()
     }
-    func deleteChosen() { guard canModifyHistory else { return }; let clips = selectedClips; guard !clips.isEmpty else { return }; remember(clips, label: "删除"); for clip in clips { delete(clip.id, recordUndo: false) }; selection = selected.map { [$0] } ?? [] }
+    func deleteChosen() { removeClipsFromCurrentView(selectedClips) }
+    func removeClipsFromCurrentView(_ clips: [Clip]) {
+        guard canModifyHistory, !clips.isEmpty else { return }
+        if let board {
+            changeBoardMembership(clips.map(\.id), from: board, to: nil)
+        } else {
+            delete(Set(clips.map(\.id)))
+        }
+    }
+    func beginShelfDrag(_ contents: ShelfDrag.Contents) -> UUID {
+        let drag = ShelfDrag(contents: contents, storageGeneration: storageCallbackGeneration)
+        pendingShelfDrag = drag
+        if AppEnvironment.current.acceptanceMode { AppDiagnostics.record("shelf.drag-start", ["type": drag.type]) }
+        return drag.reference
+    }
+    func takeShelfDrag(type: String) -> ShelfDrag? {
+        guard canModifyHistory, let drag = pendingShelfDrag, drag.type == type else { return nil }
+        pendingShelfDrag = nil
+        return drag
+    }
+    func completeShelfDrag(_ drag: ShelfDrag, reference: UUID, to board: UUID) {
+        guard drag.reference == reference, storageCallbackGeneration == drag.storageGeneration else { return }
+        switch drag.contents {
+        case .board(let id):
+            moveBoard(id, to: board)
+        case .clips(let ids, let sourceBoard):
+            changeBoardMembership(ids, from: sourceBoard, to: board)
+            if AppEnvironment.current.acceptanceMode {
+                AppDiagnostics.record("shelf.clip-drop", ["source": sourceBoard == nil ? "history" : "board", "count": String(ids.count)])
+            }
+        }
+    }
+    func changeBoardMembership(_ ids: [UUID], from source: UUID?, to destination: UUID?) {
+        guard canModifyHistory, source != destination, !ids.isEmpty else { return }
+        let boards = Set(archive.boards.map(\.id))
+        guard [source, destination].compactMap({ $0 }).allSatisfy(boards.contains) else { return }
+        let chosen = Set(ids)
+        var updated = archive
+        var changes: [BoardMembershipChange] = []
+        for index in updated.clips.indices where chosen.contains(updated.clips[index].id) {
+            let clip = updated.clips[index]
+            if let source, !clip.boards.contains(source) { continue }
+            let added = destination.flatMap { clip.boards.contains($0) ? nil : $0 }
+            guard source != nil || added != nil else { continue }
+            updated.clips[index].boards = clip.boards.filter { $0 != source } + [added].compactMap { $0 }
+            changes.append(BoardMembershipChange(id: clip.id, removed: source, added: added))
+        }
+        guard !changes.isEmpty else { return }
+        let label = source == nil ? "收藏" : (destination == nil ? "移出收藏板" : "移动收藏")
+        appendUndo(ItemUndo(clips: [], ids: Set(changes.map(\.id)), label: label, boardChanges: changes))
+        let oldIndex = selected.flatMap { visibleIndex(of: $0) }
+        let oldSelection = selected
+        archive = updated
+        if let oldIndex, let oldSelection, visibleIndex(of: oldSelection) == nil, selection.isEmpty, !filtered.isEmpty {
+            selected = filtered[min(oldIndex, filtered.count - 1)].id
+            selectionAnchor = selected
+        }
+        save()
+    }
     func restoreMany(_ clips: [Clip], plain: Bool, pasteboard: NSPasteboard = .general) -> Bool {
         guard !clips.isEmpty else { return false }
         if clips.count == 1 { return restore(clips[0], plain: plain, pasteboard: pasteboard) }
@@ -145,7 +267,7 @@ extension Clip {
         if let data = parts.first(where: { $0.type == NSPasteboard.PasteboardType.html.rawValue })?.data, let text = NSAttributedString(html: data, documentAttributes: nil) { return text }
         return NSAttributedString(string: text)
     }
-    func dragProvider() -> NSItemProvider {
+    func dragProvider(shelfReference: UUID? = nil) -> NSItemProvider {
         let parts = exportParts().flatMap { $0 }
         let provider: NSItemProvider
         if kind == "文件", let path = text.components(separatedBy: "\n").first, let file = NSItemProvider(contentsOf: URL(fileURLWithPath: path)) { provider = file } else { provider = NSItemProvider() }
@@ -170,7 +292,11 @@ extension Clip {
             }
         }
         if kind == "链接" { provider.registerDataRepresentation(forTypeIdentifier: UTType.url.identifier, visibility: .all) { completion in completion(Data(self.text.utf8), nil); return nil } }
-        provider.registerDataRepresentation(forTypeIdentifier: "io.github.SwallOwDili.OpenPaste.clip-id", visibility: .all) { completion in completion(Data(self.id.uuidString.utf8), nil); return nil }
+        let reference = shelfReference ?? id
+        provider.registerDataRepresentation(forTypeIdentifier: ShelfDrag.clipType, visibility: .all) { completion in
+            completion(Data(reference.uuidString.utf8), nil)
+            return nil
+        }
         return provider
     }
 }
@@ -247,8 +373,10 @@ extension Controller {
         let finishShowTiming = AcceptanceMetrics.begin("preview.show")
         if let anchor = previewAnchor(for: clip.id) {
             popover.show(relativeTo: anchor.rect, of: anchor.view, preferredEdge: anchor.edge)
+            previewAnchorView = anchor.view
         } else if let content = panel.contentView {
             popover.show(relativeTo: NSRect(x: content.bounds.midX, y: content.bounds.midY, width: 1, height: 1), of: content, preferredEdge: .maxY)
+            previewAnchorView = content
         }
         finishShowTiming()
         guard let window = previewWindow else { finishPreviewClose(popover); return }
@@ -258,8 +386,12 @@ extension Controller {
         }
         previewSelectionObserver = store.$selected.dropFirst().receive(on: DispatchQueue.main).sink { [weak self, weak popover] id in
             guard let self, let popover, popover === self.previewPopover, !self.previewClosing,
-                  popover.isShown, let id, id != self.previewClipID else { return }
-            self.updatePreview(to: id)
+                  popover.isShown, id == self.store.selected else { return }
+            if let id {
+                if id != self.previewClipID { self.updatePreview(to: id) }
+            } else {
+                self.closePreview(animated: false)
+            }
         }
     }
     func closePreview(animated: Bool = true) {
@@ -274,7 +406,7 @@ extension Controller {
         }
     }
     func reopenPreview() {
-        guard previewClosing, let window = previewWindow, panel.isVisible, NSApp.isActive,
+        guard previewClosing, let window = previewWindow, panel.isVisible, panel.isKeyWindow || window.isKeyWindow,
               !store.settings, !interactionState.hasModalInteraction, !interactionState.menuTracking,
               editorWindow?.isVisible != true, let clip = store.selectedClips.first else { return }
         let finishTiming = AcceptanceMetrics.begin("preview.reverse"); defer { finishTiming() }
@@ -329,6 +461,7 @@ extension Controller {
         cancelPreviewFade()
         previewSelectionObserver = nil
         previewPopover = nil; previewHost = nil; previewClipID = nil
+        previewAnchorView = nil
         previewClosing = false
         DispatchQueue.main.async { [weak self] in
             guard let self, self.previewPopover == nil else { return }
@@ -347,8 +480,11 @@ extension Controller {
         host.rootView = FullItemPreview(store: store, id: id)
         popover.contentSize = previewSize(for: store.archive.clips.first { $0.id == id })
         reanchorPreview(to: id)
-        // The shelf scrolls the new card into view asynchronously; anchor again once it has.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self, weak popover] in
+        refreshPreviewAnchor()
+    }
+    func refreshPreviewAnchor() {
+        guard let popover = previewPopover, let id = previewClipID, !previewClosing else { return }
+        DispatchQueue.main.async { [weak self, weak popover] in
             guard let self, let popover, popover === self.previewPopover, !self.previewClosing,
                   self.previewClipID == id else { return }
             self.reanchorPreview(to: id)
@@ -356,7 +492,12 @@ extension Controller {
     }
     private func reanchorPreview(to id: UUID) {
         guard let popover = previewPopover, let anchor = previewAnchor(for: id) else { return }
-        popover.positioningRect = anchor.rect
+        if anchor.view === previewAnchorView {
+            popover.positioningRect = anchor.rect
+        } else {
+            popover.show(relativeTo: anchor.rect, of: anchor.view, preferredEdge: anchor.edge)
+            previewAnchorView = anchor.view
+        }
     }
     /// The selected card, in the coordinates of the shelf's scrolling content; nil when it is not on screen.
     func previewAnchor(for id: UUID) -> (view: NSView, rect: NSRect, edge: NSRectEdge)? {
@@ -378,7 +519,7 @@ extension Controller {
     /// used when the shelf card is not the target, e.g. from the preview window.
     func rename(_ clip: Clip) {
         if previewPopover?.isShown != true, panel.isVisible, !store.settings, store.visibleIndex(of: clip.id) != nil {
-            store.searchFocused = false
+            store.disengageShelfSearch()
             store.choose(clip.id)
             store.renamingID = clip.id
             return
@@ -411,10 +552,9 @@ extension Controller {
     }
     /// ⌘← / ⌘→: cycle history and boards.
     func switchBoard(_ delta: Int) {
-        guard let target = BoardNavigation.next(from: store.board, boards: store.archive.boards.map(\.id), delta: delta) else { return }
-        store.searchFocused = false
-        store.board = target
-        if let first = store.filtered.first { store.choose(first.id) }
+        guard let target = BoardNavigation.next(from: store.board, boards: store.orderedBoards.map(\.id), delta: delta) else { return }
+        store.disengageShelfSearch()
+        store.selectBoard(target)
         panel.makeFirstResponder(panel.contentView)
     }
     func horizontalScrollView(in root: NSView, at location: NSPoint) -> NSScrollView? {
@@ -428,20 +568,28 @@ extension Controller {
     /// Starts a search from a typed key without consuming it: the key events are held
     /// until the field is first responder, then replayed so input methods compose normally.
     func beginTypeToSearch(_ event: NSEvent) {
-        pendingSearchKeys.append(event)
-        store.focusShelfSearch()
-        guard pendingSearchKeys.count == 1 else { return }
-        pendingSearchAttempts = 0
-        flushPendingSearchKeys()
+        if let pendingSearchRequest, pendingSearchRequest == store.searchFocusRequest, !pendingSearchKeys.isEmpty {
+            pendingSearchKeys.append(event)
+            return
+        }
+        pendingSearchKeys = [event]
+        let request = store.focusShelfSearch()
+        pendingSearchRequest = request
+        flushPendingSearchKeys(for: request, attempt: 0)
     }
-    private func flushPendingSearchKeys() {
+    private func flushPendingSearchKeys(for request: UUID, attempt: Int) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.01) { [weak self] in
-            guard let self, !self.pendingSearchKeys.isEmpty else { return }
-            if self.panel.firstResponder is NSTextView {
+            guard let self, self.pendingSearchRequest == request, !self.pendingSearchKeys.isEmpty else { return }
+            guard self.store.searchFocusRequest == request, self.store.searchExpanded, self.panel.isVisible,
+                  !self.store.settings, self.store.renamingID == nil else {
+                self.pendingSearchKeys.removeAll()
+                return
+            }
+            if self.store.searchFocused, self.panel.firstResponder is NSTextView {
                 let events = self.pendingSearchKeys; self.pendingSearchKeys.removeAll()
                 for event in events { self.panel.sendEvent(event) }
-            } else if self.pendingSearchAttempts < 30 {
-                self.pendingSearchAttempts += 1; self.flushPendingSearchKeys()
+            } else if attempt < 30 {
+                self.flushPendingSearchKeys(for: request, attempt: attempt + 1)
             } else {
                 let text = self.pendingSearchKeys.compactMap(\.characters).joined(); self.pendingSearchKeys.removeAll()
                 self.store.query += text

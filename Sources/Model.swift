@@ -123,7 +123,13 @@ private final class SyncEdits {
 }
 
 final class Store: ObservableObject {
-    @Published var archive = Archive() { didSet { rebuildSources(); refreshResults() } }
+    @Published var archive = Archive() {
+        didSet {
+            if archive.boards != oldValue.boards { rememberBoardOrder(orderedBoards.map(\.id)) }
+            rebuildSources()
+            refreshResults()
+        }
+    }
     @Published var paused = false
     private var pauseReasons = RecordingPauseReasons()
     var userPaused: Bool { pauseReasons.userPaused }
@@ -142,6 +148,7 @@ final class Store: ObservableObject {
     @Published var renamingID: UUID?
     @Published var query = "" { didSet { if query != oldValue { filterValueChanged() } } }
     @Published var board: UUID? { didSet { if board != oldValue { filterValueChanged() } } }
+    @Published private var boardOrder: [UUID]
     @Published var kind = "全部" { didSet { if kind != oldValue { filterValueChanged() } } }
     @Published var sourceFilter = "全部来源" { didSet { if sourceFilter != oldValue { filterValueChanged() } } }
     @Published var filtersExpanded = false
@@ -176,7 +183,7 @@ final class Store: ObservableObject {
     @Published var permissionStatus = "未授权"
     @Published var searchFocused = false
     @Published var searchExpanded = false
-    @Published private(set) var searchFocusRequest = 0
+    @Published private(set) var searchFocusRequest: UUID?
     @Published private(set) var searchResetCount = 0
     @Published var pasteQueue: [UUID] = []
     @Published var selection = Set<UUID>()
@@ -184,8 +191,7 @@ final class Store: ObservableObject {
     @Published var networkPreviews: Bool { didSet { if usePreferences { configurationDefaults?.set(networkPreviews, forKey: "networkPreviews") }; LinkPreviewCache.shared.enabled = networkPreviews } }
     @Published var indexingImages = false
     @Published var ocrProgress = ""
-    var draggingIDs: [UUID] = []
-    var dragStartedAt = Date.distantPast
+    var pendingShelfDrag: ShelfDrag?
     var selectionAnchor: UUID?
     var undoItems: [ItemUndo] = []
     let ocrQueue = DispatchQueue(label: "openpaste.ocr", qos: .utility)
@@ -250,6 +256,7 @@ final class Store: ObservableObject {
         let configurationDefaults = defaults ?? (persistsPreferences ? AppEnvironment.current.defaults : nil)
         self.configurationDefaults = configurationDefaults
         self.injectedDeviceID = deviceID ?? (persistsPreferences ? nil : UUID().uuidString)
+        boardOrder = configurationDefaults?.stringArray(forKey: "favoriteBoardOrder")?.compactMap { UUID(uuidString: $0) } ?? []
         storageLimitMB = max(200, configurationDefaults?.integer(forKey: "storageLimitMB") ?? 0)
         shortcutLabel = (configurationDefaults.map { GlobalShortcut.load(from: $0) } ?? .standard).label
         shelfShortcuts = ShelfShortcuts.load(from: configurationDefaults)
@@ -303,6 +310,7 @@ final class Store: ObservableObject {
         }
         rebuildSources()
         refreshResults()
+        if !initialLoading, !hasHistoryLoadFailure { rememberBoardOrder(orderedBoards.map(\.id)) }
         if asynchronousInitialLoad, initialLoading {
             beginInitialHistoryLoad(using: initialHistoryLoader)
         }
@@ -386,9 +394,15 @@ final class Store: ObservableObject {
     var filtered: [Clip] { visibleClips }
     func visibleIndex(of id: UUID) -> Int? { visibleIndexByID[id] }
     var sources: [String] { sourceNames }
-    func focusShelfSearch() {
+    @discardableResult func focusShelfSearch() -> UUID {
         if !searchExpanded { searchExpanded = true }
-        searchFocusRequest += 1
+        let request = UUID()
+        searchFocusRequest = request
+        return request
+    }
+    func disengageShelfSearch() {
+        if searchFocusRequest != nil { searchFocusRequest = nil }
+        if searchFocused { searchFocused = false }
     }
     func resetShelfSearch(preserveBoard: Bool = false) {
         if searchExpanded {
@@ -396,7 +410,7 @@ final class Store: ObservableObject {
             searchResetCount += 1
         }
         filtersExpanded = false
-        searchFocused = false
+        disengageShelfSearch()
         resetFilters(preserveBoard: preserveBoard)
     }
     private func filterValueChanged() {
@@ -432,7 +446,10 @@ final class Store: ObservableObject {
         visibleIndexByID.removeAll(keepingCapacity: true)
         for (index, clip) in visibleClips.enumerated() where visibleIndexByID[clip.id] == nil { visibleIndexByID[clip.id] = index }
         selection.formIntersection(Set(visibleIndexByID.keys))
-        if selected.flatMap({ visibleIndexByID[$0] }) == nil { selected = visibleClips.first?.id }
+        if selected.flatMap({ visibleIndexByID[$0] }) == nil {
+            selected = visibleClips.first { selection.contains($0.id) }?.id ?? visibleClips.first?.id
+        }
+        if selectionAnchor.flatMap({ visibleIndexByID[$0] }) == nil { selectionAnchor = selected }
     }
     func moveSelection(_ delta: Int) {
         guard !visibleClips.isEmpty else { return }
@@ -615,6 +632,7 @@ final class Store: ObservableObject {
         syncBaseline = snapshot
         if updateArchive {
             archive = snapshot.archive
+            if let board, !archive.boards.contains(where: { $0.id == board }) { selectBoard(nil) }
             discardMissingQueueItems()
         }
     }
@@ -708,6 +726,7 @@ final class Store: ObservableObject {
     func invalidatePendingStorageCallbacks(keepingQueuedSave: Bool = false) {
         directoryMutation += 1
         storageCallbackGeneration += 1
+        pendingShelfDrag = nil
         if !keepingQueuedSave { _ = saveGeneration.next() }
         savePending = false
         storageRetryInFlight = false
@@ -868,34 +887,73 @@ final class Store: ObservableObject {
         if new.kind == "链接", networkPreviews, !ephemeral { enrichLink(new) }
         return new.id
     }
-    func delete(_ id: UUID, recordUndo: Bool = true) {
+    func delete(_ id: UUID) { delete([id]) }
+    func delete(_ ids: Set<UUID>) {
         guard canModifyHistory else { return }
-        if recordUndo, let clip = archive.clips.first(where: { $0.id == id }) { remember([clip], label: "删除") }
-        if currentClipID == id {
+        let removed = archive.clips.filter { ids.contains($0.id) }
+        guard !removed.isEmpty else { return }
+        remember(removed, label: "删除")
+        if let id = currentClipID, ids.contains(id) {
             deletedCurrentChange = change
             deletedCurrentID = id
             currentClipID = nil
         }
-        let before = filtered
-        let index = before.firstIndex(where: { $0.id == id })
-        let wasSelected = selected == id
-        archive.clips.removeAll { $0.id == id }
-        pasteQueue.removeAll { $0 == id }
-        if wasSelected, let index = index { let remaining = filtered; selected = remaining.isEmpty ? nil : remaining[min(index, remaining.count - 1)].id }
+        let removedSelectionIndex = selected.flatMap { ids.contains($0) ? visibleIndex(of: $0) : nil }
+        archive.clips.removeAll { ids.contains($0.id) }
+        pasteQueue.removeAll { ids.contains($0) }
+        if let index = removedSelectionIndex, selection.isEmpty, !filtered.isEmpty {
+            selected = filtered[min(index, filtered.count - 1)].id
+            selectionAnchor = selected
+        }
         save()
     }
     func pin(_ clip: Clip, to board: UUID) {
-        guard canModifyHistory, let i = archive.clips.firstIndex(where: { $0.id == clip.id }) else { return }
-        if archive.clips[i].boards.contains(board) { archive.clips[i].boards.removeAll { $0 == board } } else { archive.clips[i].boards.append(board) }; save()
+        guard let current = archive.clips.first(where: { $0.id == clip.id }) else { return }
+        if current.boards.contains(board) { changeBoardMembership([clip.id], from: board, to: nil) }
+        else { changeBoardMembership([clip.id], from: nil, to: board) }
     }
     func addBoard(_ name: String) { let name = name.trimmingCharacters(in: .whitespacesAndNewlines); guard canModifyHistory, !name.isEmpty else { return }; archive.boards.append(Board(name: name)); save() }
+    var orderedBoards: [Board] {
+        guard !boardOrder.isEmpty else { return archive.boards }
+        var remaining = Dictionary(archive.boards.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        let ordered = boardOrder.compactMap { remaining.removeValue(forKey: $0) }
+        return ordered + archive.boards.filter { remaining[$0.id] != nil }
+    }
+    func selectBoard(_ id: UUID?) {
+        guard board != id else { return }
+        selection.removeAll()
+        board = id
+        selected = filtered.first?.id
+        selectionAnchor = selected
+    }
+    func moveBoard(_ id: UUID, to target: UUID) {
+        guard canModifyHistory, id != target else { return }
+        var order = orderedBoards.map(\.id)
+        guard let sourceIndex = order.firstIndex(of: id), let targetIndex = order.firstIndex(of: target) else { return }
+        order.remove(at: sourceIndex)
+        order.insert(id, at: targetIndex)
+        rememberBoardOrder(order)
+    }
+    private func rememberBoardOrder(_ order: [UUID]) {
+        guard boardOrder != order else { return }
+        boardOrder = order
+        if usePreferences { configurationDefaults?.set(order.map(\.uuidString), forKey: "favoriteBoardOrder") }
+    }
     func setBoardColor(_ id: UUID, color: String) { guard canModifyHistory, let i = archive.boards.firstIndex(where: { $0.id == id }) else { return }; archive.boards[i].color = color; save() }
     func renameBoard(_ id: UUID, to name: String) {
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canModifyHistory, !name.isEmpty, let i = archive.boards.firstIndex(where: { $0.id == id }), archive.boards[i].name != name else { return }
         archive.boards[i].name = name; save()
     }
-    func removeBoard(_ id: UUID) { guard canModifyHistory else { return }; archive.boards.removeAll { $0.id == id }; for i in archive.clips.indices { archive.clips[i].boards.removeAll { $0 == id } }; if board == id { board = nil }; prune(); save() }
+    func removeBoard(_ id: UUID) {
+        guard canModifyHistory, archive.boards.contains(where: { $0.id == id }) else { return }
+        var updated = archive
+        updated.boards.removeAll { $0.id == id }
+        for index in updated.clips.indices { updated.clips[index].boards.removeAll { $0 == id } }
+        archive = updated
+        if board == id { selectBoard(nil) }
+        save()
+    }
     func clearHistory() {
         guard canModifyHistory else { return }
         if let id = currentClipID, archive.clips.contains(where: { $0.id == id && $0.boards.isEmpty }) {

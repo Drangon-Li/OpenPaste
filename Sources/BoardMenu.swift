@@ -26,7 +26,7 @@ private final class SwatchView: NSView {
         self.name = name; self.selected = selected; self.onPick = onPick
         super.init(frame: NSRect(x: 0, y: 0, width: 26, height: 26))
         toolTip = name
-        setAccessibilityRole(.button); setAccessibilityLabel(name)
+        setAccessibilityElement(true); setAccessibilityRole(.button); setAccessibilityLabel(name)
     }
     required init?(coder: NSCoder) { fatalError() }
     override func draw(_ dirtyRect: NSRect) {
@@ -41,6 +41,7 @@ private final class SwatchView: NSView {
         }
     }
     override func mouseDown(with event: NSEvent) { onPick(name) }
+    override func accessibilityPerformPress() -> Bool { onPick(name); return true }
     override var acceptsFirstResponder: Bool { false }
 }
 
@@ -67,13 +68,25 @@ enum BoardMenuBuilder {
         let renameItem = ClosureMenuItem(title: "重命名", handler: rename)
         let deleteItem = ClosureMenuItem(title: "删除收藏板（保留内容）…", handler: delete)
         menu.addItem(renameItem); menu.addItem(deleteItem); menu.addItem(.separator())
-        let colors = NSMenuItem()
-        colors.view = ColorRowView(current: board.color) { [weak menu] name in
+        addColors(to: menu, current: board.color, pick: pick)
+        return menu
+    }
+
+    @MainActor
+    static func palette(current: String?, pick: @escaping (String) -> Void) -> NSMenu {
+        let menu = NSMenu(); menu.autoenablesItems = false
+        addColors(to: menu, current: current, pick: pick)
+        return menu
+    }
+
+    @MainActor
+    private static func addColors(to menu: NSMenu, current: String?, pick: @escaping (String) -> Void) {
+        let colors = NSMenuItem(title: "收藏板颜色", action: nil, keyEquivalent: "")
+        colors.view = ColorRowView(current: current) { [weak menu] name in
             menu?.cancelTracking()
             pick(name)
         }
         menu.addItem(colors)
-        return menu
     }
 }
 
@@ -86,6 +99,124 @@ private final class ClosureMenuItem: NSMenuItem {
     }
     required init(coder: NSCoder) { fatalError() }
     @objc private func fire() { handler() }
+}
+
+private struct BoardColorButton: NSViewRepresentable {
+    let board: Board
+    let enabled: Bool
+    let pick: (String) -> Void
+    let makeContextMenu: () -> NSMenu
+
+    func makeNSView(context: Context) -> ColorButton {
+        let button = ColorButton()
+        button.image = NSImage(systemSymbolName: "circle.fill", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .regular))
+        button.imagePosition = .imageOnly
+        button.isBordered = false
+        button.target = button
+        button.action = #selector(ColorButton.showPalette)
+        return button
+    }
+
+    func updateNSView(_ button: ColorButton, context: Context) {
+        button.isEnabled = enabled
+        button.contentTintColor = BoardPalette.nsColor(board.color)
+        button.toolTip = "更改收藏板颜色"
+        button.setAccessibilityLabel("更改“\(board.name)”颜色")
+        button.setAccessibilityValue(board.color ?? "红色")
+        button.makePalette = { BoardMenuBuilder.palette(current: board.color, pick: pick) }
+        button.makeContextMenu = makeContextMenu
+    }
+
+    final class ColorButton: NSButton {
+        var makePalette: (() -> NSMenu)?
+        var makeContextMenu: (() -> NSMenu)?
+
+        @objc func showPalette() {
+            let bottom = isFlipped ? bounds.maxY : bounds.minY
+            makePalette?().popUp(positioning: nil, at: NSPoint(x: bounds.minX, y: bottom), in: self)
+        }
+
+        override func menu(for event: NSEvent) -> NSMenu? { makeContextMenu?() }
+
+        override func mouseDown(with event: NSEvent) {
+            if event.modifierFlags.contains(.control), let menu = makeContextMenu?() {
+                NSMenu.popUpContextMenu(menu, with: event, for: self)
+            } else {
+                super.mouseDown(with: event)
+            }
+        }
+    }
+}
+
+struct ShelfBoardTab: View {
+    let board: Board
+    let store: Store
+    @State private var dropTargeted = false
+
+    var body: some View {
+        let shape = RoundedRectangle(cornerRadius: 8)
+        HStack(spacing: 0) {
+            BoardColorButton(board: board, enabled: store.canModifyHistory, pick: pickColor, makeContextMenu: contextMenu)
+                .frame(width: 22, height: 28)
+            Button { store.selectBoard(board.id) } label: {
+                Text(board.name)
+                    .font(.system(size: 13, weight: .medium))
+                    .frame(minHeight: 28)
+                    .padding(.trailing, 10)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("拖动调整收藏板顺序")
+            .onDrag(boardProvider)
+        }
+        .padding(.leading, 4)
+        .foregroundStyle(Color.primary)
+        .background(store.board == board.id ? Color(nsColor: BoardPalette.nsColor(board.color)).opacity(0.12) : Color.clear, in: shape)
+        .contentShape(Rectangle())
+        .overlay {
+            if dropTargeted && store.canModifyHistory {
+                shape.strokeBorder(Color.accentColor, lineWidth: 1.5).allowsHitTesting(false)
+            }
+        }
+        .onDrop(of: [ShelfDrag.boardType, ShelfDrag.clipType], isTargeted: $dropTargeted, perform: receiveDrop)
+        .overlay { RightClickMenu(makeMenu: contextMenu) }
+    }
+
+    private func pickColor(_ color: String) {
+        guard color != (board.color ?? "红色") else { return }
+        store.setBoardColor(board.id, color: color)
+    }
+
+    private func contextMenu() -> NSMenu {
+        BoardMenuBuilder.menu(for: board,
+                              rename: { Controller.shared.renameBoard(board) },
+                              delete: { Controller.shared.confirmRemoveBoard(board) },
+                              pick: pickColor)
+    }
+
+    private func boardProvider() -> NSItemProvider {
+        let provider = NSItemProvider()
+        guard store.canModifyHistory else { return provider }
+        let reference = store.beginShelfDrag(.board(board.id))
+        let data = Data(reference.uuidString.utf8)
+        provider.registerDataRepresentation(forTypeIdentifier: ShelfDrag.boardType, visibility: .all) { complete in
+            complete(data, nil)
+            return nil
+        }
+        return provider
+    }
+
+    private func receiveDrop(_ providers: [NSItemProvider]) -> Bool {
+        guard store.canModifyHistory, let type = store.pendingShelfDrag?.type,
+              let provider = providers.first(where: { $0.hasItemConformingToTypeIdentifier(type) }),
+              let drag = store.takeShelfDrag(type: type) else { return false }
+        provider.loadDataRepresentation(forTypeIdentifier: type) { data, _ in
+            guard let data, let reference = UUID(uuidString: String(decoding: data, as: UTF8.self)) else { return }
+            DispatchQueue.main.async { store.completeShelfDrag(drag, reference: reference, to: board.id) }
+        }
+        return true
+    }
 }
 
 /// Transparent overlay that only claims right-clicks (and Control-clicks), so left clicks,

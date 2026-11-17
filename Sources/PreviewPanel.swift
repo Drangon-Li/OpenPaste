@@ -111,10 +111,12 @@ struct PreviewImage: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .task(id: clip.fingerprint) {
+            image = nil
             let data = clip.parts.flatMap { $0 }.first { ["public.png", "public.tiff", "public.jpeg", "public.heic", "public.gif"].contains($0.type) }?.data
-            image = await withCheckedContinuation { continuation in
+            let decoded: NSImage? = await withCheckedContinuation { continuation in
                 DispatchQueue.global(qos: .userInitiated).async { continuation.resume(returning: data.flatMap { NSImage(data: $0) }) }
             }
+            if !Task.isCancelled { image = decoded }
         }
     }
 }
@@ -138,16 +140,17 @@ struct FullItemPreview: View {
     }
 
     private func header(_ clip: Clip) -> some View {
-        HStack(spacing: 12) {
+        let boards = store.orderedBoards
+        return HStack(spacing: 12) {
             Button { Controller.shared.closePreview() } label: {
                 Image(systemName: "xmark.circle.fill").font(.system(size: 22)).foregroundStyle(.secondary)
             }.buttonStyle(.plain).help("关闭 · Esc").accessibilityLabel("关闭预览")
             Text(clip.cardTitle).font(.system(size: 16, weight: .semibold)).lineLimit(1)
                 .onTapGesture { Controller.shared.rename(clip) }.help("重命名 · ⌘R")
             Spacer(minLength: 8)
-            if !store.archive.boards.isEmpty {
+            if !boards.isEmpty {
                 Menu {
-                    ForEach(store.archive.boards) { board in
+                    ForEach(boards) { board in
                         Button((clip.boards.contains(board.id) ? "✓ " : "") + board.name) { store.pin(clip, to: board.id) }
                     }
                 } label: {
@@ -168,7 +171,7 @@ struct FullItemPreview: View {
         let icon = Image(systemName: "square.and.arrow.up").font(.system(size: 16))
         if clip.kind == "链接", let url = URL(string: clip.text) { ShareLink(item: url) { icon }.buttonStyle(.plain) }
         else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { ShareLink(item: URL(fileURLWithPath: path)) { icon }.buttonStyle(.plain) }
-        else if clip.kind == "图片" { ImageShareButton(clip: clip) }
+        else if clip.kind == "图片" { ImageShareButton(clip: clip).id(clip.id) }
         else { ShareLink(item: clip.text) { icon }.buttonStyle(.plain) }
     }
 
@@ -176,7 +179,7 @@ struct FullItemPreview: View {
         Group {
             if clip.kind == "链接", let url = URL(string: clip.text), LinkPreviewCache.allowed(url) { LinkBrowser(url: url) }
             else if clip.kind == "文件", let path = clip.text.components(separatedBy: "\n").first { SystemFilePreview(url: URL(fileURLWithPath: path)) }
-            else if clip.kind == "图片" { PreviewImage(clip: clip) }
+            else if clip.kind == "图片" { PreviewImage(clip: clip).id(clip.id) }
             else if let color = CapturedColor.parse(clip.text) {
                 ZStack {
                     Color(nsColor: color.nsColor)
@@ -248,10 +251,12 @@ struct ImageShareButton: View {
             }
         }
         .task(id: clip.fingerprint) {
+            image = nil
             let data = clip.parts.flatMap { $0 }.first { ["public.png", "public.tiff", "public.jpeg", "public.heic", "public.gif"].contains($0.type) }?.data
-            image = await withCheckedContinuation { continuation in
+            let decoded: NSImage? = await withCheckedContinuation { continuation in
                 DispatchQueue.global(qos: .userInitiated).async { continuation.resume(returning: data.flatMap { NSImage(data: $0) }) }
             }
+            if !Task.isCancelled { image = decoded }
         }
     }
 }

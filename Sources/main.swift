@@ -67,7 +67,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     var wheelMonitor: Any?
     var shelfAwaitingActivation = false
     var pendingSearchKeys: [NSEvent] = []
-    var pendingSearchAttempts = 0
+    var pendingSearchRequest: UUID?
     var menuObservers: [NSObjectProtocol] = []
     var trackingMenus = Set<ObjectIdentifier>()
     var menuTransition = 0
@@ -81,6 +81,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     var previewFadeTimer: DispatchSourceTimer?
     var previewFadeGeneration = 0
     var previewHost: NSHostingController<FullItemPreview>?
+    weak var previewAnchorView: NSView?
     var previewSelectionObserver: AnyCancellable?
     var previewWindow: NSWindow? { previewPopover?.isShown == true ? previewHost?.view.window : nil }
     var previewClipID: UUID?
@@ -255,8 +256,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             self.dismissShelfForExternalInteraction(reason: .activation)
         }
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
-            guard let self, !self.panel.frame.contains(NSEvent.mouseLocation) || !self.panel.isVisible else { return }
-            self.dismissShelfForExternalInteraction(reason: .outsideClick)
+            // Global monitors receive clicks dispatched to other apps, even over the shelf's screen coordinates.
+            self?.dismissShelfForExternalInteraction(reason: .outsideClick)
         }
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         status.button?.image = menuBarMark()
@@ -283,8 +284,12 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         var spec = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
         InstallEventHandler(GetApplicationEventTarget(), { _, event, _ in Controller.shared?.hotkeyFired(eventTime: event.map { GetEventTime($0) }); return noErr }, 1, &spec, nil, &handler)
         _ = installShortcut(shortcut, persist: false)
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged, .leftMouseDown]) { [weak self] event in
             guard let self = self else { return event }
+            if event.type == .leftMouseDown {
+                self.store.pendingShelfDrag = nil
+                return event
+            }
             if event.type == .flagsChanged {
                 let flags = event.modifierFlags
                 self.store.reverseHistory = InteractionPolicy.reverseHistoryEnabled(
@@ -327,7 +332,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                     return nil
                 }
                 // The preview follows the shelf selection, so arrows simply move it.
-                if plain, event.keyCode == 123 || event.keyCode == 124 { self.store.searchFocused = false; self.store.moveSelection(event.keyCode == 124 ? 1 : -1); return nil }
+                if plain, event.keyCode == 123 || event.keyCode == 124 { self.store.disengageShelfSearch(); self.store.moveSelection(event.keyCode == 124 ? 1 : -1); return nil }
                 if event.modifierFlags.contains(.command), let clip = self.previewClip {
                     switch event.charactersIgnoringModifiers?.lowercased() { case "e": self.edit(clip); return nil; case "r": self.rename(clip); return nil; case "o": self.openItem(clip); return nil; default: break }
                 }
@@ -376,7 +381,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
                 if event.keyCode == 48 { self.store.focusShelfSearch(); return nil }
                 if !event.modifierFlags.intersection([.command, .control, .option]).isEmpty { }
                 else if let chars = event.characters, !chars.isEmpty, chars.unicodeScalars.allSatisfy({ !CharacterSet.controlCharacters.contains($0) }), ![36,49,123,124,125,126,48,53,51,117].contains(event.keyCode) { self.beginTypeToSearch(event); return nil }
-            } else if event.keyCode == 48 || event.keyCode == 125 { self.store.searchFocused = false; self.panel.makeFirstResponder(self.panel.contentView); return nil }
+            } else if event.keyCode == 48 || event.keyCode == 125 { self.store.disengageShelfSearch(); self.panel.makeFirstResponder(self.panel.contentView); return nil }
             if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers?.lowercased() == "f" { self.store.focusShelfSearch(); return nil }
             let quick = self.store.shelfShortcuts.quickPasteMatch(event.modifierFlags)
             if quick.matches, let n = Int(event.charactersIgnoringModifiers ?? ""), n >= 1, n <= 9, self.store.filtered.count >= n { self.paste(self.store.filtered[n - 1], plain: quick.plain); return nil }
@@ -388,7 +393,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
             }
             if [123, 124].contains(event.keyCode), self.panel.firstResponder is NSTextView { return event }
             if [123, 124, 125].contains(event.keyCode), !event.modifierFlags.contains(.command) {
-                self.store.searchFocused = false
+                self.store.disengageShelfSearch()
                 self.panel.makeFirstResponder(self.panel.contentView)
                 if event.keyCode != 125 {
                     let delta = event.keyCode == 124 ? 1 : -1
@@ -610,6 +615,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         if TestMode.ui { print("UI show target: \(target?.bundleIdentifier ?? "none")"); fflush(stdout) }
         pasteGeneration += 1
         pendingSearchKeys.removeAll()
+        store.pendingShelfDrag = nil
         store.resetShelfSearch()
         if !preview, AppEnvironment.current.defaults.bool(forKey: "recordingAccepted") { store.capture(force: true) }
         refreshPermission()
@@ -727,6 +733,8 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func hideShelf() {
         logInteraction("shelf.hide", reason: "explicit")
         shelfAwaitingActivation = false
+        store.pendingShelfDrag = nil
+        store.disengageShelfSearch()
         closePreview(animated: false)
         cancelTranslation()
         store.reverseHistory = false
@@ -788,6 +796,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         rememberExternalTarget()
         settingsRequest += 1
         store.settings = true
+        store.disengageShelfSearch()
         closePreview(animated: false)
         cancelTranslation()
         store.reverseHistory = false
@@ -1058,9 +1067,13 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         })
     }
     func dismissShelfForExternalInteraction(reason: ShelfDismissReason = .outsideClick) {
-        guard panel.isVisible, !modalShowing, panel.attachedSheet == nil,
-              (previewClosing || previewWindow?.isVisible != true), editorWindow?.isVisible != true, !store.settings else { return }
-        if interactionState.menuTracking {
+        guard panel.isVisible, !store.settings else { return }
+        if reason != .outsideClick, shelfDragTracking { return }
+        let interaction = interactionState
+        guard !interaction.hasModalInteraction, !interaction.editorVisible else { return }
+        // Opening the popover can move key focus from a non-activating shelf within this app.
+        if reason == .resignKey, interaction.previewVisible, !previewClosing { return }
+        if interaction.menuTracking {
             if reason == .outsideClick { pendingOutsideClick = true }
             else { pendingApplicationSwitch = true }
             logInteraction("shelf.dismiss-deferred", reason: reason.rawValue)
@@ -1069,15 +1082,21 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
         // Delayed activation/resign notifications must still refer to another app.
         guard reason == .outsideClick || (!NSApp.isActive && externalApplicationActive) else { return }
         logInteraction("shelf.hide", reason: reason.rawValue)
+        store.pendingShelfDrag = nil
+        store.disengageShelfSearch()
         closePreview(animated: false)
         cancelTranslation()
         store.reverseHistory = false
         panel.orderOut(nil)
     }
+    private var shelfDragTracking: Bool {
+        store.pendingShelfDrag != nil && (NSEvent.pressedMouseButtons & 1) != 0
+    }
     func windowDidResignKey(_ notification: Notification) {
         if let window = notification.object as? NSWindow, window === panel {
             logInteraction("shelf.resign-key")
             store.reverseHistory = false
+            guard !shelfDragTracking else { return }
             let presentation = shelfPresentation
             RunLoop.main.perform(inModes: [.default]) { [weak self] in
                 guard let self, self.shelfPresentation == presentation, !self.panel.isKeyWindow else { return }
@@ -1091,6 +1110,7 @@ final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, NSPop
     func windowDidResize(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window === panel else { return }
         store.compact = window.frame.height < 270
+        refreshPreviewAnchor()
         if !preview { AppEnvironment.current.defaults.set(Double(window.frame.height), forKey: "shelfHeight") }
         if let screen = window.screen, abs(window.frame.minY - screen.frame.minY) > 0.5 || abs(window.frame.width - screen.frame.width) > 0.5 { window.setFrame(NSRect(x: screen.frame.minX, y: screen.frame.minY, width: screen.frame.width, height: window.frame.height), display: true) }
     }
@@ -1466,6 +1486,7 @@ struct ShelfView: View {
 
     var body: some View {
         let renderedClips = Array(store.filtered.prefix(renderedClipCount))
+        let boards = store.orderedBoards
         VStack(spacing: 0) {
             Rectangle().fill(Color.clear).frame(height: 6).contentShape(Rectangle())
                 .overlay(Capsule().fill(Color.secondary.opacity(0.25)).frame(width: 36, height: 2))
@@ -1491,38 +1512,9 @@ struct ShelfView: View {
                     .popover(isPresented: $store.filtersExpanded, arrowEdge: .bottom) { searchFilters }
                     .transition(.opacity)
                 }
-                tab("历史", icon: "clock.arrow.circlepath", active: store.board == nil) { store.board = nil }
-                ForEach(store.archive.boards) { board in
-                    Button { store.board = board.id } label: {
-                        HStack(spacing: 7) {
-                            Circle().fill(boardColor(board.color)).frame(width: 9, height: 9)
-                            Text(board.name)
-                        }.font(.system(size: 13, weight: .medium)).padding(.horizontal, 10).padding(.vertical, 6)
-                            .background(store.board == board.id ? boardColor(board.color).opacity(0.12) : Color.clear, in: RoundedRectangle(cornerRadius: 8))
-                            .foregroundStyle(Color.primary)
-                    }.buttonStyle(.plain).help("右键更改收藏板颜色")
-                        .onDrop(of: ["io.github.SwallOwDili.OpenPaste.clip-id"], isTargeted: nil) { providers in
-                            if !store.draggingIDs.isEmpty, Date().timeIntervalSince(store.dragStartedAt) < 60 {
-                                let ids = store.draggingIDs; store.draggingIDs.removeAll()
-                                for id in ids { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
-                                if TestMode.featureUI { print("UI board pinned \(ids.count) items"); fflush(stdout) }
-                                return true
-                            }
-                            guard let provider = providers.first else { return false }
-                            provider.loadDataRepresentation(forTypeIdentifier: "io.github.SwallOwDili.OpenPaste.clip-id") { data, error in
-                                if TestMode.featureUI { print("UI drop data bytes=\(data?.count ?? -1) error=\(error?.localizedDescription ?? "none")"); fflush(stdout) }
-                                guard let data, let string = String(data: data, encoding: .utf8), let id = UUID(uuidString: string) else { return }
-                                DispatchQueue.main.async { if let clip = store.archive.clips.first(where: { $0.id == id }), !clip.boards.contains(board.id) { store.pin(clip, to: board.id) } }
-                            }; return true
-                        }
-                        .overlay {
-                            RightClickMenu {
-                                BoardMenuBuilder.menu(for: board,
-                                                      rename: { Controller.shared.renameBoard(board) },
-                                                      delete: { Controller.shared.confirmRemoveBoard(board) },
-                                                      pick: { store.setBoardColor(board.id, color: $0) })
-                            }
-                        }
+                tab("历史", icon: "clock.arrow.circlepath", active: store.board == nil) { store.selectBoard(nil) }
+                ForEach(boards) { board in
+                    ShelfBoardTab(board: board, store: store)
                 }
                 Button(action: { Controller.shared.newBoard() }) { Image(systemName: "plus") }.buttonStyle(.plain).help("新建收藏板")
                 Spacer(minLength: 0)
@@ -1544,6 +1536,7 @@ struct ShelfView: View {
             .padding(.horizontal, ShelfLayout.horizontalInset)
             .frame(height: 60)
             .animation(reduceMotion ? nil : .easeInOut(duration: 0.20), value: store.searchExpanded)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: boards.map(\.id))
             if !store.pasteQueue.isEmpty { HStack { Text("粘贴队列剩余 \(store.pasteQueue.count) 条"); Button("下一条 · ⌘↵") { Controller.shared.pasteNext() }; Button("结束") { store.pasteQueue.removeAll() } }.font(.caption) }
             if !store.captureNotice.isEmpty { Text(store.captureNotice).font(.system(size: 12)).foregroundStyle(.orange).frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 24).padding(.bottom, 4) }
             if store.filtered.isEmpty {
@@ -1554,11 +1547,12 @@ struct ShelfView: View {
                         LazyHStack(spacing: ShelfLayout.cardSpacing) {
                             if store.translating { VStack(spacing: 12) { ProgressView(); Text("正在翻译…"); Text("原文保持不变").font(.caption).foregroundStyle(.secondary) }.frame(width: store.compact ? 180 : 240).frame(maxHeight: .infinity).background(.quaternary, in: RoundedRectangle(cornerRadius: 12)) }
                             ForEach(renderedClips) { clip in
-                                ClipCard(clip: clip, index: store.visibleIndex(of: clip.id) ?? 0, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, renaming: store.renamingID == clip.id, compact: store.compact, networkPreviews: store.networkPreviews, boards: store.archive.boards, store: store).equatable().id(clip.id)
+                                ClipCard(clip: clip, index: store.visibleIndex(of: clip.id) ?? 0, selected: store.selection.contains(clip.id) || clip.id == store.selected, current: clip.id == store.currentClipID, renaming: store.renamingID == clip.id, compact: store.compact, networkPreviews: store.networkPreviews, boards: boards, activeBoard: store.board, store: store).equatable().id(clip.id)
                                     .onAppear { if clip.id == renderedClips.last?.id { growRenderWindow() } }
                             }
                         }.padding(.horizontal, ShelfLayout.horizontalInset).padding(.vertical, ShelfLayout.verticalInset).id("shelf-content")
                     }.onChange(of: store.selected) { _, id in if let id { revealAndScroll(to: id, proxy: proxy) } }
+                    .onChange(of: store.selected.flatMap { store.visibleIndex(of: $0) }) { Controller.shared.refreshPreviewAnchor() }
                     .onReceive(NotificationCenter.default.publisher(for: Controller.shelfShownNotification)) { _ in
                         if let id = store.selected { revealAndScroll(to: id, proxy: proxy) }
                     }
@@ -1617,9 +1611,11 @@ struct ShelfView: View {
         }
         .onChange(of: store.searchFocusRequest) { _, request in
             let panel = Controller.shared?.panel
+            guard let request else { searchFocused = false; return }
             if !(panel?.firstResponder is NSTextView) { searchFocused = false }
             DispatchQueue.main.async {
-                guard store.searchExpanded, store.searchFocusRequest == request, panel?.isKeyWindow == true else { return }
+                guard store.searchExpanded, store.searchFocusRequest == request, store.renamingID == nil,
+                      panel?.isVisible == true, panel?.isKeyWindow == true else { return }
                 searchFocused = true
             }
         }
@@ -1744,29 +1740,26 @@ struct ShelfView: View {
     }
     func revealAndScroll(to id: UUID, proxy: ScrollViewProxy) {
         guard let index = store.visibleIndex(of: id) else { return }
-        if index == 0, !store.translating { proxy.scrollTo("shelf-content", anchor: .leading); return }
+        if index == 0, !store.translating {
+            proxy.scrollTo("shelf-content", anchor: .leading)
+            Controller.shared.refreshPreviewAnchor()
+            return
+        }
         let required = ShelfRenderWindow.countIncluding(index: index, total: store.filtered.count)
         if required > renderedClipCount {
             renderedClipCount = required
-            DispatchQueue.main.async { proxy.scrollTo(id) }
+            DispatchQueue.main.async {
+                guard store.selected == id else { return }
+                proxy.scrollTo(id)
+                Controller.shared.refreshPreviewAnchor()
+            }
         } else {
             proxy.scrollTo(id)
+            Controller.shared.refreshPreviewAnchor()
         }
     }
     func tab(_ name: String, icon: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) { Label(name, systemImage: icon).font(.system(size: 13, weight: .medium)).padding(.horizontal, 10).padding(.vertical, 6).background(active ? Color.primary.opacity(0.08) : Color.clear, in: RoundedRectangle(cornerRadius: 8)).foregroundStyle(Color.primary) }.buttonStyle(.plain)
-    }
-}
-func boardColor(_ name: String?) -> Color {
-    switch name {
-    case "橙色": return .orange
-    case "黄色": return .yellow
-    case "绿色": return .green
-    case "青色": return .cyan
-    case "蓝色": return .blue
-    case "紫色": return .purple
-    case "灰色": return .gray
-    default: return .red
     }
 }
 func ageLabel(_ date: Date, now: Date) -> String {
@@ -1786,6 +1779,7 @@ struct ClipCard: View, Equatable {
     let compact: Bool
     let networkPreviews: Bool
     let boards: [Board]
+    let activeBoard: UUID?
     let store: Store
     @State private var previousClick: (timestamp: TimeInterval, selection: Set<UUID>)?
     static func == (lhs: Self, rhs: Self) -> Bool {
@@ -1798,6 +1792,7 @@ struct ClipCard: View, Equatable {
             && lhs.compact == rhs.compact
             && lhs.networkPreviews == rhs.networkPreviews
             && lhs.boards == rhs.boards
+            && lhs.activeBoard == rhs.activeBoard
             && lhs.store === rhs.store
             && lhs.clip.title == rhs.clip.title
             && lhs.clip.userLabel == rhs.clip.userLabel
@@ -1843,7 +1838,7 @@ struct ClipCard: View, Equatable {
                                 .onTapGesture {
                                     // A click on an already selected card's title renames it.
                                     if selected && store.selection.count <= 1 { Controller.shared.rename(clip) }
-                                    else { store.searchFocused = false; store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
+                                    else { store.disengageShelfSearch(); store.choose(clip.id, modifiers: NSEvent.modifierFlags); Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView) }
                                 }
                         }
                         if current { Text("当前").font(.system(size: 10)).opacity(0.75) }; if !clip.boards.isEmpty { Image(systemName: "pin.fill").font(.system(size: 10)) } }
@@ -1891,7 +1886,13 @@ struct ClipCard: View, Equatable {
         .overlay(RoundedRectangle(cornerRadius: 12).stroke(selected ? Color.blue : Color.primary.opacity(0.08), lineWidth: selected ? 2 : 1))
         .shadow(color: .black.opacity(0.03), radius: 2, y: 1)
         .contentShape(Rectangle())
-        .onDrag { let selected = store.selectedClips; store.draggingIDs = selected.contains(where: { $0.id == clip.id }) ? selected.map(\.id) : [clip.id]; store.dragStartedAt = Date(); if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }; return clip.dragProvider() }
+        .onDrag {
+            let selected = store.selectedClips
+            let ids = selected.contains { $0.id == clip.id } ? selected.map(\.id) : [clip.id]
+            let reference = store.beginShelfDrag(.clips(ids, sourceBoard: activeBoard))
+            if TestMode.featureUI { print("UI drag began kind=\(clip.kind)"); fflush(stdout) }
+            return clip.dragProvider(shelfReference: reference)
+        }
         .onTapGesture(perform: handleClick)
         .contextMenu {
             Button("粘贴") { Controller.shared.pasteSelection(fallback: clip) }
@@ -1907,7 +1908,9 @@ struct ClipCard: View, Equatable {
             }
             Menu("收藏到") { ForEach(boards) { b in Button((clip.boards.contains(b.id) ? "✓ " : "") + b.name) { store.pin(clip, to: b.id) } }; Button("新建收藏板…") { Controller.shared.newBoard() } }
             Divider()
-            Button("删除 · ⌘⌫", role: .destructive) { store.delete(clip.id) }
+            Button(activeBoard == nil ? "删除历史条目 · ⌘⌫" : "移出收藏板 · ⌘⌫", role: .destructive) {
+                store.removeClipsFromCurrentView([clip])
+            }
         }
     }
 
@@ -1923,7 +1926,7 @@ struct ClipCard: View, Equatable {
             // The first click can collapse a multi-selection before the second click arrives.
             previousClick = event.clickCount == 1 ? (event.timestamp, store.selection) : nil
         }
-        store.searchFocused = false
+        store.disengageShelfSearch()
         store.choose(clip.id, modifiers: event?.modifierFlags ?? NSEvent.modifierFlags)
         Controller.shared.panel.makeFirstResponder(Controller.shared.panel.contentView)
     }
